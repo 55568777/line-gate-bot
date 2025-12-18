@@ -42,7 +42,7 @@ async function reply(token, messages) {
 }
 
 async function push(to, messages) {
-  await fetch("https://api.line.me/v2/bot/message/push", {
+  const r = await fetch("https://api.line.me/v2/bot/message/push", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -50,6 +50,8 @@ async function push(to, messages) {
     },
     body: JSON.stringify({ to, messages })
   });
+  const txt = await r.text();
+  console.log("PUSH_STATUS", r.status, txt);
 }
 
 function getState(uid) {
@@ -121,4 +123,5 @@ app.post("/webhook", async (req, res) => {
 
 app.get("/", (_, res) => res.send("ok"));
 app.listen(process.env.PORT || 3000);
+
 
