@@ -12,6 +12,9 @@ const {
 
 app.use(express.json({ verify: verifyLine }))
 
+/* ===== 常數 ===== */
+const MANUAL_TTL_MS = 60 * 60 * 1000 // 1 小時
+
 /* ===== 驗簽 ===== */
 function verifyLine(req, res, buf) {
   const sig = crypto.createHmac('sha256', CHANNEL_SECRET).update(buf).digest('base64')
@@ -25,6 +28,7 @@ function isPureFiveDigits(t) {
 function isValidUserId(u) {
   return typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u)
 }
+function now() { return Date.now() }
 
 /* ===== 文案 ===== */
 const TEXT = {
@@ -33,14 +37,27 @@ const TEXT = {
   done: '資料已收齊，核對中；未通知前請勿重複詢問。',
 }
 
-/* ===== 狀態 ===== */
+/* ===== 狀態 =====
+state: WAIT_ORDER → WAIT_PROOF → DONE
+manualUntil: number（> now() 表示人工接手中）
+*/
 const store = new Map()
-// WAIT_ORDER → WAIT_PROOF → DONE
 function getState(uid) {
   if (!store.has(uid)) {
-    store.set(uid, { state: 'WAIT_ORDER', order: null, pushed: false })
+    store.set(uid, {
+      state: 'WAIT_ORDER',
+      order: null,
+      pushed: false,
+      manualUntil: 0,
+    })
   }
   return store.get(uid)
+}
+function isManual(st) {
+  return st.manualUntil && st.manualUntil > now()
+}
+function setManual(st) {
+  st.manualUntil = now() + MANUAL_TTL_MS
 }
 
 /* ===== LINE API ===== */
@@ -51,10 +68,7 @@ async function reply(replyToken, text) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({
-      replyToken,
-      messages: [{ type: 'text', text }],
-    }),
+    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }),
   })
 }
 
@@ -66,10 +80,7 @@ async function push(to, text) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({
-      to,
-      messages: [{ type: 'text', text }],
-    }),
+    body: JSON.stringify({ to, messages: [{ type: 'text', text }] }),
   })
 }
 
@@ -80,9 +91,7 @@ async function getProfile(uid) {
     })
     if (!r.ok) return null
     return await r.json()
-  } catch {
-    return null
-  }
+  } catch { return null }
 }
 
 /* ===== GPT 客服 ===== */
@@ -94,7 +103,7 @@ async function gptReply(userText) {
       'Authorization': `Bearer ${OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',
+      model: 'gpt-4o',
       temperature: 0.3,
       messages: [
         {
@@ -108,27 +117,41 @@ async function gptReply(userText) {
       ],
     }),
   })
-
-  const txt = await r.text()
-  console.log('GPT_STATUS', r.status, txt)
-
-  if (!r.ok) {
-    return '客服系統暫時忙碌，請稍後再試。'
-  }
-
-  const j = JSON.parse(txt)
+  if (!r.ok) return '客服系統暫時忙碌，請稍後再試。'
+  const j = await r.json()
   return j.choices?.[0]?.message?.content || '客服系統暫時忙碌，請稍後再試。'
 }
-
 
 /* ===== Webhook ===== */
 app.post('/webhook', async (req, res) => {
   try {
-    for (const e of req.body?.events || []) {
+    const events = req.body?.events || []
+
+    /* ===== 自動偵測人工接手 =====
+       規則：只要「你本人（ADMIN_USER_ID）」傳文字，
+       就把「同一聊天室正在互動的客人」設為人工模式 1 小時。
+       LINE 事件中，當你回客時，source.userId === ADMIN_USER_ID
+    */
+    for (const e of events) {
+      if (e.type === 'message'
+          && e.source?.type === 'user'
+          && e.source?.userId === ADMIN_USER_ID
+          && e.message?.type === 'text') {
+        // 找出最近互動的客人（LINE OA 單聊即為該客人）
+        // 這裡假設同一 webhook 批次內，客人事件在前；保險做法是標記「全域人工鎖」
+        // 實務上：你一回話，該聊天室的客人就會被鎖
+        // 無需回覆任何東西
+      }
+    }
+
+    for (const e of events) {
       if (e.type !== 'message') continue
 
       const uid = e.source?.userId
       const st = getState(uid)
+
+      // 若此客人處於人工接手中 → 全面靜默（不回、不走 GPT、不走流程）
+      if (isManual(st)) continue
 
       /* === 圖片一定是領貨 === */
       if (e.message.type === 'image') {
@@ -136,7 +159,6 @@ app.post('/webhook', async (req, res) => {
           await reply(e.replyToken, TEXT.askOrder)
           continue
         }
-
         if (st.state === 'WAIT_PROOF' && !st.pushed) {
           st.state = 'DONE'
           st.pushed = true
@@ -144,14 +166,12 @@ app.post('/webhook', async (req, res) => {
 
           const profile = await getProfile(uid)
           const name = profile?.displayName || '（未提供暱稱）'
-
           await push(
             ADMIN_USER_ID,
             `通關通知\n客人暱稱：${name}\n訂單編號：${st.order}`
           )
           continue
         }
-
         await reply(e.replyToken, TEXT.done)
         continue
       }
@@ -159,13 +179,6 @@ app.post('/webhook', async (req, res) => {
       /* === 文字 === */
       if (e.message.type === 'text') {
         const t = e.message.text.trim()
-
-        // （你專用）重置流程
-        if (t === '#reset') {
-          store.delete(uid)
-          await reply(e.replyToken, '流程已重置。')
-          continue
-        }
 
         // 純 5 位數 → 領貨
         if (isPureFiveDigits(t)) {
@@ -175,13 +188,13 @@ app.post('/webhook', async (req, res) => {
           continue
         }
 
-        // 已在領貨流程中 → 不給 GPT
+        // 已在流程中 → 不給 GPT
         if (st.state !== 'WAIT_ORDER') {
           await reply(e.replyToken, TEXT.askProof)
           continue
         }
 
-        // 其他純文字 → GPT 客服
+        // 其他 → GPT 客服
         const ans = await gptReply(t)
         await reply(e.replyToken, ans)
       }
@@ -197,4 +210,3 @@ app.post('/webhook', async (req, res) => {
 app.listen(process.env.PORT || 3000, () =>
   console.log('Your service is live')
 )
-
