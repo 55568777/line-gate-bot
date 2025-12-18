@@ -7,26 +7,32 @@ const app = express()
 const {
   CHANNEL_ACCESS_TOKEN,
   CHANNEL_SECRET,
-  ADMIN_USER_ID,     // 你的私人 LINE userId（U開頭32位）
+  ADMIN_USER_ID,
   OPENAI_API_KEY,
 } = process.env
+
+/* ===== 驗簽（不 throw） ===== */
+function verifyLine(req, res, buf) {
+  const sig = crypto
+    .createHmac('sha256', CHANNEL_SECRET)
+    .update(buf)
+    .digest('base64')
+
+  if (sig !== req.headers['x-line-signature']) {
+    req._badSig = true
+  }
+}
 
 app.use(express.json({ verify: verifyLine }))
 
 /* ===== 常數 ===== */
-const MANUAL_TTL_MS = 60 * 60 * 1000          // 通關後：該客人單獨人工 1 小時
-const MANUAL_PING_COOLDOWN_MS = 2 * 60 * 1000 // 彙整推播：每位客人最多 2 分鐘推一次
-
-/* ===== 驗簽 ===== */
-function verifyLine(req, res, buf) {
-  const sig = crypto.createHmac('sha256', CHANNEL_SECRET).update(buf).digest('base64')
-  if (sig !== req.headers['x-line-signature']) throw new Error('Bad signature')
-}
+const MANUAL_TTL_MS = 60 * 60 * 1000
+const MANUAL_PING_COOLDOWN_MS = 2 * 60 * 1000
 
 /* ===== 工具 ===== */
-function isPureFiveDigits(t) { return /^\d{5}$/.test((t || '').trim()) }
-function isValidUserId(u) { return typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u) }
-function now() { return Date.now() }
+const now = () => Date.now()
+const isPureFiveDigits = t => /^\d{5}$/.test((t || '').trim())
+const isValidUserId = u => typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u)
 
 function briefOfMessage(e) {
   const mt = e?.message?.type
@@ -36,30 +42,27 @@ function briefOfMessage(e) {
   if (mt === 'audio') return '[音訊]'
   if (mt === 'file') return `[檔案] ${(e.message.fileName || '').slice(0, 40)}`
   if (mt === 'sticker') return '[貼圖]'
-  return `[${mt || 'unknown'}]`
+  return '[未知]'
 }
 
-/* ✅ 領貨/付款/序號意圖：WAIT_ORDER 時命中就直接要 5 位數訂單（不走 GPT） */
+/* ===== 領貨意圖判斷（已修） ===== */
 function hasPickupIntent(t) {
-  const s = (t || '').trim().toLowerCase()
+  const s = (t || '').trim()
 
-  // ❌ 你指定不要攔的
-  const exclude = /(等很久了|怎麼那麼久|到底好了沒|處理一下|回一下|在嗎|人呢|快一點|不回是怎樣)/i
-  if (exclude.test(s)) return false
+  const exclude = [
+    '等很久了','怎麼那麼久','到底好了沒','處理一下',
+    '回一下','在嗎','人呢','快一點','不回是怎樣',
+  ]
+  if (exclude.some(k => s.includes(k))) return false
 
-  // ✅ 要攔的（付款／領貨／序號／出貨／查單）
-  const include = /(已付款|我已付款|付款了|付了|錢付了|付過了|
-                    已轉帳|轉帳了|匯款了|已匯款|繳費了|已繳費|付款完成|
-                    刷卡了|刷過了|有付錢|有給錢|
-                    領貨|取貨|拿貨|我要領|我要拿|可以領了嗎|可以拿了嗎|
-                    出貨了嗎|幾時出貨|發貨了嗎|什麼時候發|
-                    寄了嗎|寄了沒|幾時寄|什麼時候到|到了沒|
-                    序號呢|序號在哪|卡呢|點數呢|
-                    怎麼還沒給|沒收到序號|沒發|還沒發|
-                    東西呢|貨呢|
-                    我都付了|什麼時候好|幫我看一下|看一下訂單|幫我查|查一下)/ix
-
-  return include.test(s)
+  const include = [
+    '已付款','付款了','轉帳','匯款','繳費','刷卡',
+    '領貨','取貨','拿貨',
+    '出貨','發貨','寄了','到了沒',
+    '序號','點數','卡',
+    '沒收到','幫我查','查訂單',
+  ]
+  return include.some(k => s.includes(k))
 }
 
 /* ===== 文案 ===== */
@@ -77,10 +80,7 @@ function getState(uid) {
       state: 'WAIT_ORDER',
       order: null,
       pushed: false,
-
       manualUntil: 0,
-
-      // 彙整推播用
       _lastManualPingAt: 0,
       _manualBurstCount: 0,
       _manualLastBrief: '',
@@ -89,7 +89,18 @@ function getState(uid) {
   return store.get(uid)
 }
 
-function isManual(st) { return st.manualUntil && st.manualUntil > now() }
+function isManual(st) {
+  if (!st.manualUntil) return false
+  if (st.manualUntil > now()) return true
+
+  // ✅ 人工期結束 → 重置狀態（修 #3）
+  st.manualUntil = 0
+  st.state = 'WAIT_ORDER'
+  st.order = null
+  st.pushed = false
+  return false
+}
+
 function setManual(st) {
   st.manualUntil = now() + MANUAL_TTL_MS
   st._lastManualPingAt = 0
@@ -97,29 +108,35 @@ function setManual(st) {
   st._manualLastBrief = ''
 }
 
-/* ===== LINE API ===== */
+/* ===== LINE API（修 #5） ===== */
 async function reply(replyToken, text) {
   if (!replyToken) return
-  await fetch('https://api.line.me/v2/bot/message/reply', {
+  const r = await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}`,
+      Authorization: `Bearer ${CHANNEL_ACCESS_TOKEN}`,
     },
     body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }),
   })
+  if (!r.ok) {
+    console.error('LINE reply fail', r.status, await r.text())
+  }
 }
 
 async function push(to, text) {
   if (!isValidUserId(to)) return
-  await fetch('https://api.line.me/v2/bot/message/push', {
+  const r = await fetch('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}`,
+      Authorization: `Bearer ${CHANNEL_ACCESS_TOKEN}`,
     },
     body: JSON.stringify({ to, messages: [{ type: 'text', text }] }),
   })
+  if (!r.ok) {
+    console.error('LINE push fail', r.status, await r.text())
+  }
 }
 
 async function getProfile(uid) {
@@ -129,16 +146,18 @@ async function getProfile(uid) {
     })
     if (!r.ok) return null
     return await r.json()
-  } catch { return null }
+  } catch {
+    return null
+  }
 }
 
-/* ===== GPT 客服 ===== */
+/* ===== GPT ===== */
 async function gptReply(userText) {
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
       model: 'gpt-4o',
@@ -147,9 +166,7 @@ async function gptReply(userText) {
         {
           role: 'system',
           content:
-`你是官方客服，語氣冷靜、專業、簡短。
-你不能確認訂單、不能說已完成、不能說已收齊。
-若提到領貨，一律指示：提供 5 位數訂單編號，再上傳付款截圖。`,
+            '你是官方客服，語氣冷靜、專業、簡短。若提到領貨，一律指示提供 5 位數訂單編號與付款截圖。',
         },
         { role: 'user', content: userText },
       ],
@@ -162,102 +179,86 @@ async function gptReply(userText) {
 
 /* ===== Webhook ===== */
 app.post('/webhook', async (req, res) => {
+  if (req._badSig) return res.sendStatus(401)
+
   try {
     const events = req.body?.events || []
 
     for (const e of events) {
-      if (e.type !== 'message') continue
-      if (e.source?.type !== 'user') continue
+      if (e.type !== 'message' || e.source?.type !== 'user') continue
 
-      const uid = e.source?.userId
-      const msgType = e.message?.type
+      const uid = e.source.userId
       const st = getState(uid)
 
-      /* ===== 人工期間（單一客人）：不回客，但要「彙整」推播給你 ===== */
+      /* 人工期：不回客，只彙整推播 */
       if (isManual(st)) {
-        st._manualBurstCount = (st._manualBurstCount || 0) + 1
+        st._manualBurstCount++
         st._manualLastBrief = briefOfMessage(e)
 
-        const lastAt = st._lastManualPingAt || 0
-        const canPing = (now() - lastAt) > MANUAL_PING_COOLDOWN_MS
-
-        if (canPing) {
+        if (now() - st._lastManualPingAt > MANUAL_PING_COOLDOWN_MS) {
           st._lastManualPingAt = now()
 
           const profile = await getProfile(uid)
-          const name = profile?.displayName || '（未提供暱稱）'
-
-          const n = st._manualBurstCount || 0
-          const last = st._manualLastBrief || ''
-          st._manualBurstCount = 0
-          st._manualLastBrief = ''
-
           await push(
             ADMIN_USER_ID,
-            `人工期間新訊息（彙整）\n客人暱稱：${name}\n訂單：${st.order || '（未填）'}\n本段共：${n} 則\n最後：${last}`
+            `人工期間新訊息（彙整）
+客人暱稱：${profile?.displayName || '未提供'}
+訂單：${st.order || '未填'}
+本段共：${st._manualBurstCount} 則
+最後：${st._manualLastBrief}`
           )
+
+          st._manualBurstCount = 0
+          st._manualLastBrief = ''
         }
         continue
       }
 
-      /* === 圖片：領貨流程 === */
-      if (msgType === 'image') {
-        if (st.state === 'WAIT_ORDER') {
-          await reply(e.replyToken, TEXT.askOrder)
-          continue
-        }
+      /* 圖片 */
+      if (e.message.type === 'image') {
         if (st.state === 'WAIT_PROOF' && !st.pushed) {
           st.state = 'DONE'
           st.pushed = true
           await reply(e.replyToken, TEXT.done)
-
-          // 通關後：只鎖這位客人 1 小時
           setManual(st)
 
           const profile = await getProfile(uid)
-          const name = profile?.displayName || '（未提供暱稱）'
           await push(
             ADMIN_USER_ID,
-            `通關通知\n客人暱稱：${name}\n訂單編號：${st.order}`
+            `通關通知\n客人暱稱：${profile?.displayName || '未提供'}\n訂單編號：${st.order}`
           )
-          continue
+        } else {
+          await reply(e.replyToken, TEXT.askOrder)
         }
+        continue
+      }
+
+      /* 文字 */
+      const t = (e.message.text || '').trim()
+
+      if (isPureFiveDigits(t)) {
+        st.order = t
+        st.state = 'WAIT_PROOF'
+        await reply(e.replyToken, TEXT.askProof)
+        continue
+      }
+
+      if (st.state === 'WAIT_ORDER' && hasPickupIntent(t)) {
+        await reply(e.replyToken, TEXT.askOrder)
+        continue
+      }
+
+      if (st.state === 'WAIT_PROOF') {
+        await reply(e.replyToken, TEXT.askProof)
+        continue
+      }
+
+      if (st.state === 'DONE') {
         await reply(e.replyToken, TEXT.done)
         continue
       }
 
-      /* === 文字 === */
-      if (msgType === 'text') {
-        const t = (e.message.text || '').trim()
-
-        // 5 位數訂單 → 進 WAIT_PROOF
-        if (isPureFiveDigits(t)) {
-          st.order = t
-          st.state = 'WAIT_PROOF'
-          await reply(e.replyToken, TEXT.askProof)
-          continue
-        }
-
-        // ✅ WAIT_ORDER 時命中「領貨/付款/序號」意圖 → 直接要訂單（不走 GPT）
-        if (st.state === 'WAIT_ORDER' && hasPickupIntent(t)) {
-          await reply(e.replyToken, TEXT.askOrder)
-          continue
-        }
-
-        // 領貨流程中，不走 GPT
-        if (st.state === 'WAIT_PROOF') {
-          await reply(e.replyToken, TEXT.askProof)
-          continue
-        }
-        if (st.state === 'DONE') {
-          await reply(e.replyToken, TEXT.done)
-          continue
-        }
-
-        // 其他 → GPT
-        const ans = await gptReply(t)
-        await reply(e.replyToken, ans)
-      }
+      await reply(e.replyToken, await gptReply(t))
     }
 
     res.sendStatus(200)
@@ -267,4 +268,6 @@ app.post('/webhook', async (req, res) => {
   }
 })
 
-app.listen(process.env.PORT || 3000, () => console.log('Your service is live'))
+app.listen(process.env.PORT || 3000, () =>
+  console.log('Your service is live')
+)
