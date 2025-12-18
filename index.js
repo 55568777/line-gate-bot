@@ -86,6 +86,11 @@ const STATE_FLUSH_INTERVAL_MS = 10_000
 const PRUNE_AFTER_MS = 10 * 24 * 60 * 60 * 1000
 const MAX_USERS = 10_000
 
+// ===== 手動：24 小時最近名單 + 編號選擇（只有你能下指令）=====
+const RECENT_TTL_MS = 24 * 60 * 60 * 1000
+const RECENT_MAX_SHOW = 20
+const ADMIN_PICK_TTL_MS = 5 * 60 * 1000 // 選單有效 5 分鐘
+
 /* ===== KB（kb.json TopK 檢索 + 熱更新 + 原子更新） ===== */
 const KB_PATH = path.resolve(process.cwd(), 'kb.json')
 let KB = []
@@ -349,6 +354,14 @@ function isManual(st) {
 
 function setManual(st) {
   st.manualUntil = now() + MANUAL_TTL_MS
+  st._lastManualPingAt = 0
+  st._manualBurstCount = 0
+  st._manualLastBrief = ''
+  markDirty(st)
+}
+
+function endManual(st) {
+  st.manualUntil = 0
   st._lastManualPingAt = 0
   st._manualBurstCount = 0
   st._manualLastBrief = ''
@@ -772,6 +785,171 @@ async function gptReplyDirect(userText) {
   }
 }
 
+/* ===== 24 小時最近名單（只記有來訊） ===== */
+const recent = new Map() // uid -> { uid, name, lastAt }
+function pruneRecent() {
+  const n = now()
+  for (const [uid, it] of recent) {
+    if (!it?.lastAt || (n - it.lastAt > RECENT_TTL_MS)) recent.delete(uid)
+  }
+}
+function recordRecent(uid) {
+  if (!isValidUserId(uid)) return
+  pruneRecent()
+  const n = now()
+  const cached = profileCache.get(uid)?.data
+  const name = cached?.displayName || recent.get(uid)?.name || null
+  recent.set(uid, { uid, name, lastAt: n })
+}
+async function ensureRecentNames(uids = []) {
+  // 盡量補齊顯示名（最多 10 個避免打爆）
+  const need = []
+  for (const uid of uids) {
+    const it = recent.get(uid)
+    if (!it) continue
+    if (!it.name) need.push(uid)
+    if (need.length >= 10) break
+  }
+  await Promise.allSettled(need.map(async uid => {
+    const p = await getProfile(uid)
+    const it = recent.get(uid)
+    if (it && p?.displayName) recent.set(uid, { ...it, name: p.displayName })
+  }))
+}
+function recentSortedList() {
+  pruneRecent()
+  return [...recent.values()].sort((a, b) => (b.lastAt || 0) - (a.lastAt || 0))
+}
+function matchByName(keyword) {
+  const k = norm(keyword)
+  if (!k) return []
+  const list = recentSortedList()
+  return list.filter(it => norm(it.name || '').includes(k))
+}
+
+/* ===== 管理員指令：#人工 / #結束人工（只有你能下指令） ===== */
+let adminPick = null
+// adminPick = { mode: 'MANUAL'|'END', createdAt, items: [{uid,name,lastAt}] }
+
+function clearAdminPick() {
+  adminPick = null
+}
+function adminPickExpired() {
+  if (!adminPick) return true
+  if (!adminPick.createdAt) return true
+  return (now() - adminPick.createdAt) > ADMIN_PICK_TTL_MS
+}
+function buildPickText(mode, items) {
+  const title = mode === 'MANUAL' ? '請選擇要「切人工」的客人' : '請選擇要「結束人工」的客人'
+  const lines = items.slice(0, RECENT_MAX_SHOW).map((it, i) => {
+    const nm = it.name || '未提供'
+    const tm = it.lastAt ? tzTimeHHMM(it.lastAt) : '--:--'
+    return `${i + 1}. ${nm}（${tm}）`
+  })
+  return `${title}：\n` + lines.join('\n') + `\n\n回覆「1」或「#選 1」即可。`
+}
+
+function parsePickIndex(text) {
+  const t = String(text || '').trim()
+  let m = t.match(/^#?選\s*(\d{1,2})$/)
+  if (!m) m = t.match(/^#?(\d{1,2})$/)
+  if (!m) return null
+  const n = Number(m[1])
+  if (!Number.isFinite(n) || n <= 0) return null
+  return n
+}
+
+async function handleAdminTextCommand(e) {
+  const text = String(e?.message?.text || '').trim()
+  if (!text) return false
+
+  // 若有待選單：允許直接用編號選（抓錯可重選：再次 #人工 最近 / #人工 暱稱 會覆蓋選單）
+  if (adminPick && !adminPickExpired()) {
+    const idx = parsePickIndex(text)
+    if (idx != null) {
+      const it = adminPick.items[idx - 1]
+      if (!it) {
+        await replyMany(e.replyToken, [`編號無效（1-${adminPick.items.length}）。請重選。`])
+        return true
+      }
+      const uid = it.uid
+      const st = getState(uid)
+
+      if (adminPick.mode === 'MANUAL') {
+        setManual(st) // 不受冷卻/排隊/反洗版影響
+        const p = await getProfile(uid)
+        const nm = p?.displayName || it.name || '未提供'
+        await replyMany(e.replyToken, [`已切人工：${nm}`])
+      } else {
+        endManual(st)
+        const p = await getProfile(uid)
+        const nm = p?.displayName || it.name || '未提供'
+        await replyMany(e.replyToken, [`已結束人工：${nm}`])
+      }
+      clearAdminPick()
+      return true
+    }
+  }
+
+  // 僅接受管理員指令：#人工 / #結束人工
+  const mManual = text.match(/^#人工(?:\s+(.+))?$/)
+  const mEnd = text.match(/^#結束人工(?:\s+(.+))?$/)
+
+  if (!mManual && !mEnd) return false
+
+  const mode = mManual ? 'MANUAL' : 'END'
+  const arg = String((mManual ? mManual[1] : mEnd[1]) || '').trim()
+
+  // 最近
+  if (!arg || arg === '最近') {
+    const list = recentSortedList().slice(0, RECENT_MAX_SHOW)
+    if (list.length === 0) {
+      clearAdminPick()
+      await replyMany(e.replyToken, ['最近 24 小時沒有任何客人來訊。'])
+      return true
+    }
+    await ensureRecentNames(list.map(x => x.uid))
+    const list2 = recentSortedList().slice(0, RECENT_MAX_SHOW)
+
+    adminPick = { mode, createdAt: now(), items: list2 }
+    await replyMany(e.replyToken, [buildPickText(mode, list2)])
+    return true
+  }
+
+  // 用暱稱找人（只在 24h 最近名單內找）
+  {
+    const hits = matchByName(arg)
+    if (hits.length === 0) {
+      clearAdminPick()
+      await replyMany(e.replyToken, [`找不到「${arg}」：最近 24 小時內沒有符合的客人。`])
+      return true
+    }
+
+    await ensureRecentNames(hits.map(x => x.uid))
+    const hits2 = matchByName(arg)
+
+    if (hits2.length === 1) {
+      const it = hits2[0]
+      const uid = it.uid
+      const st = getState(uid)
+
+      if (mode === 'MANUAL') setManual(st)
+      else endManual(st)
+
+      const p = await getProfile(uid)
+      const nm = p?.displayName || it.name || '未提供'
+      await replyMany(e.replyToken, [mode === 'MANUAL' ? `已切人工：${nm}` : `已結束人工：${nm}`])
+      clearAdminPick()
+      return true
+    }
+
+    const list = hits2.slice(0, RECENT_MAX_SHOW)
+    adminPick = { mode, createdAt: now(), items: list }
+    await replyMany(e.replyToken, [buildPickText(mode, list)])
+    return true
+  }
+}
+
 /* ===== Webhook ===== */
 app.post('/webhook', async (req, res) => {
   if (req._badSig) return res.sendStatus(401)
@@ -799,6 +977,16 @@ app.post('/webhook', async (req, res) => {
 
       jobs.push(
         enqueue(uid, async () => {
+          // ===== 管理員指令（只有你能下指令；客人打 #人工 無效）=====
+          if (uid === ADMIN_USER_ID && e.message?.type === 'text') {
+            const handled = await handleAdminTextCommand(e)
+            if (handled) return
+            // 管理員若不是指令，就當一般訊息，不干擾其他流程
+          }
+
+          // ===== 24h 最近名單：只記錄「有來訊的客人」=====
+          if (uid && uid !== ADMIN_USER_ID) recordRecent(uid)
+
           const st = getState(uid)
           expireIfNeeded(st)
           normalizeCooldown(st)
@@ -940,6 +1128,9 @@ app.post('/webhook', async (req, res) => {
           /* 文字 */
           const t = (e.message.text || '').trim()
           touch(st)
+
+          // 客人亂打 #人工：完全無效（只當一般文字，不觸發任何手動功能）
+          // （管理員指令已在上面先行處理）
 
           // 取消/重來/傳錯：WAIT_PROOF / DONE 直接回到 WAIT_ORDER
           if ((st.state === 'WAIT_PROOF' || st.state === 'DONE') && hasResetIntent(t)) {
