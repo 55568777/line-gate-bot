@@ -27,15 +27,28 @@ function requireEnv() {
 }
 requireEnv()
 
-/* ===== 驗簽（不 throw） ===== */
+/* ===== 驗簽（timing-safe，不 throw） ===== */
 function verifyLine(req, res, buf) {
   try {
-    if (!CHANNEL_SECRET) { req._badSig = true; return }
-    const sig = crypto
+    const headerSig = req.headers['x-line-signature']
+    if (!CHANNEL_SECRET || typeof headerSig !== 'string' || !headerSig) {
+      req._badSig = true
+      return
+    }
+
+    const computed = crypto
       .createHmac('sha256', CHANNEL_SECRET)
       .update(buf)
       .digest('base64')
-    if (sig !== req.headers['x-line-signature']) req._badSig = true
+
+    // timing-safe compare
+    const a = Buffer.from(computed)
+    const b = Buffer.from(headerSig)
+    if (a.length !== b.length) {
+      req._badSig = true
+      return
+    }
+    if (!crypto.timingSafeEqual(a, b)) req._badSig = true
   } catch {
     req._badSig = true
   }
@@ -103,7 +116,7 @@ try {
   })
 } catch (_) {}
 
-/* ===== KB 命中更嚴格 ===== */
+/* ===== KB 命中更嚴格 + 調整門檻（更穩定帶出） ===== */
 function kbScore(query, item) {
   const q = norm(query)
   if (!q) return { score: 0, ratio: 0, strong: false }
@@ -112,6 +125,7 @@ function kbScore(query, item) {
   const ans = norm(item.answer || '')
   const tags = (item.tags || []).map(norm)
 
+  // 句子包含：強命中
   if (q.length >= 4 && qs.some(x => x.includes(q))) {
     return { score: 999, ratio: 1, strong: true }
   }
@@ -143,7 +157,9 @@ function kbTopK(query, k = 4) {
   if (!best) return []
 
   if (best.strong) return ranked.map(x => x.it)
-  if (best.score >= 3 && best.ratio >= 0.6) return ranked.map(x => x.it)
+
+  // ★ 放寬：避免「有些問法」抓不到 KB
+  if (best.score >= 2 && best.ratio >= 0.4) return ranked.map(x => x.it)
 
   return []
 }
@@ -197,6 +213,14 @@ function hasPickupIntent(t) {
   return other.some(k => s.includes(k))
 }
 
+/* ===== 發票意圖：固定導去問與答（不要求訂單）===== */
+function hasInvoiceIntent(t = '') {
+  const s = String(t).trim()
+  if (!s) return false
+  const keys = ['發票', '电子发票', '電子發票', '統編', '载具', '載具', '抬頭', '開票', '开票']
+  return keys.some(k => s.includes(k))
+}
+
 /* ===== 取消/重來/傳錯 ===== */
 function hasResetIntent(t = '') {
   const s = String(t).trim()
@@ -219,6 +243,10 @@ const TEXT = {
   needText: '一般問題請用文字描述；若要領貨，請先提供【5 位數訂單編號】。',
   busy: '客服系統暫時忙碌，請稍後再試。',
   imageNoText: '若要領貨，請先提供【5 位數訂單編號】；一般問題請用文字說明。',
+
+  invoiceFaq:
+`我們提供電子發票。
+發票說明與常見問題請至【問與答 → 發票相關】查看。`,
 
   queueEnter:
 `機器人目前正在處理其他用戶，
@@ -264,7 +292,7 @@ function defaultState() {
     gptReadyNotifiedAt: 0,
 
     cooldownUntil: 0,
-    cooldownNotifiedAt: 0, // ★ 冷卻提示只顯示一次
+    cooldownNotifiedAt: 0,
 
     spam30Start: 0, spam30Count: 0,
     spam120Start: 0, spam120Count: 0,
@@ -314,7 +342,6 @@ function expireIfNeeded(st) {
 function isManual(st) {
   if (!st.manualUntil) return false
   if (st.manualUntil > now()) return true
-  // ★ 人工期結束：只清 manual，不要硬 reset 流程（避免 DONE 被清空）
   st.manualUntil = 0
   markDirty(st)
   return false
@@ -530,6 +557,7 @@ function extractOrderCandidate(text) {
   if (/^\d{5}$/.test(s)) return s
 
   const hasLongDigitRun = /\d{7,}/.test(s)
+
   const m = s.match(/(?:^|[^\d])(\d{5})(?:[^\d]|$)/)
   if (!m) return null
   const five = m[1]
@@ -545,13 +573,12 @@ function extractOrderCandidate(text) {
   if (keywordNear) return five
 
   if (hasLongDigitRun) return null
+
   return five
 }
 
 /* ===== GPT：併發/排隊/反洗版 ===== */
 let gptActive = 0
-
-// ★ 用「head index」避免 shift 造成慢與殘留成本
 const gptWaitQueue = []
 let gptWaitHead = 0
 const gptQueuedSet = new Set()
@@ -594,17 +621,14 @@ async function notifyNextQueuedUsers() {
     const uid = gptWaitQueue[gptWaitHead++]
     if (!uid) break
 
-    // 這個 uid 已被解除排隊 → stale，跳過
     if (!gptQueuedSet.has(uid)) continue
     gptQueuedSet.delete(uid)
 
     const st = store.get(uid)
     if (!st) continue
 
-    // 人工期不通知
     if (isManual(st)) { unqueueUser(uid, st); continue }
 
-    // 冷卻中：保留排隊資格，但不通知（放回隊列尾巴）
     if (st.cooldownUntil && st.cooldownUntil > n) {
       queueUserForGpt(uid, st)
       continue
@@ -612,13 +636,11 @@ async function notifyNextQueuedUsers() {
 
     if (!st.gptQueued) continue
 
-    // 節流：避免短時間重複 push
     if (st.gptReadyNotifiedAt && (n - st.gptReadyNotifiedAt) < 2 * 60 * 1000) {
       queueUserForGpt(uid, st)
       continue
     }
 
-    // A 方案：通知後先退出「排隊中」，等待他再發一次問題
     st.gptQueued = false
     st.gptReadyNotifiedAt = n
     markDirty(st)
@@ -634,7 +656,6 @@ function onGptFinished() {
   notifyNextQueuedUsers().catch(() => {})
 }
 
-// ★ 原子占位：避免「同時進來」超過 5
 function tryAcquireGptSlot() {
   if (gptActive >= GPT_MAX_CONCURRENT) return false
   gptActive++
@@ -677,7 +698,7 @@ function shouldReplyQueueMessage(st, ms = GPT_QUEUE_REMIND_MS) {
 function enterCooldown(st) {
   const n = now()
   st.cooldownUntil = n + GPT_COOLDOWN_MS
-  st.cooldownNotifiedAt = 0 // ★ 冷卻訊息「尚未提示」
+  st.cooldownNotifiedAt = 0
   st.gptQueued = false
   st.gptQueuedAt = 0
   st.gptReadyNotifiedAt = 0
@@ -685,7 +706,6 @@ function enterCooldown(st) {
   markDirty(st)
 }
 
-// ★ 冷卻到期自動清掉（避免殘留）
 function normalizeCooldown(st) {
   if (st.cooldownUntil && st.cooldownUntil <= now()) {
     st.cooldownUntil = 0
@@ -694,16 +714,12 @@ function normalizeCooldown(st) {
   }
 }
 
-/*
-  ★ 排隊中任何訊息都要算洗版（含貼圖/圖片/其他）
-  回傳：{ handled: boolean, replyText: string|null }
-*/
 function handleQueuedAntiSpam(st, wasQueuedAlready) {
   bumpSpamCounters(st)
 
   if (st.spam120Count >= SPAM120_HARD_THRESHOLD) {
     enterCooldown(st)
-    return { handled: true, replyText: TEXT.cooldown, cooldownOnce: true }
+    return { handled: true, replyText: TEXT.cooldown }
   }
 
   const strongWarn = (st.spam30Count >= SPAM30_THRESHOLD) || (st.spam120Count >= SPAM120_THRESHOLD)
@@ -716,7 +732,7 @@ function handleQueuedAntiSpam(st, wasQueuedAlready) {
   return { handled: true, replyText: null }
 }
 
-/* ===== GPT：Responses API + timeout（不在這裡增減 gptActive） ===== */
+/* ===== GPT：Responses API + timeout（用 instructions） ===== */
 async function gptReplyDirect(userText) {
   if (!OPENAI_API_KEY) return TEXT.busy
 
@@ -724,15 +740,6 @@ async function gptReplyDirect(userText) {
   const timer = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS)
 
   try {
-    const input = [
-      {
-        role: 'system',
-        content:
-          '你是官方客服，語氣冷靜、專業、簡短。若提到領貨，一律指示提供 5 位數訂單編號與付款截圖。若有知識庫答案則必須遵守；沒有才自由回答。',
-      },
-      { role: 'user', content: userText },
-    ]
-
     const r = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
@@ -742,7 +749,9 @@ async function gptReplyDirect(userText) {
       body: JSON.stringify({
         model: OPENAI_MODEL || 'gpt-4o',
         temperature: 0.3,
-        input,
+        instructions:
+          '你是官方客服，語氣冷靜、專業、簡短。若提到領貨，一律指示提供 5 位數訂單編號與付款截圖。若有知識庫答案則必須遵守；沒有才自由回答。',
+        input: [{ role: 'user', content: userText }],
       }),
       signal: controller.signal,
     })
@@ -834,7 +843,6 @@ app.post('/webhook', async (req, res) => {
 
           /* ===== 冷卻中：只影響一般問題/GPT；領貨照走 ===== */
           if (st.cooldownUntil && st.cooldownUntil > now()) {
-            // 先讓領貨流程繼續（文字才能走訂單）
             if (e.message.type === 'text') {
               const t0 = (e.message.text || '').trim()
 
@@ -870,7 +878,6 @@ app.post('/webhook', async (req, res) => {
               }
             }
 
-            // 非領貨：冷卻提示只顯示一次
             if (!st.cooldownNotifiedAt) {
               st.cooldownNotifiedAt = now()
               markDirty(st)
@@ -903,10 +910,8 @@ app.post('/webhook', async (req, res) => {
               return
             }
 
-            // ★ 若正在 GPT 排隊：圖片也算洗版（但不影響領貨）
             if (st.gptQueued) {
-              const wasQueuedAlready = true
-              const r = handleQueuedAntiSpam(st, wasQueuedAlready)
+              const r = handleQueuedAntiSpam(st, true)
               if (r.replyText) await replyWithGreetingIfNeeded(st, e.replyToken, r.replyText, meta)
               return
             }
@@ -918,10 +923,8 @@ app.post('/webhook', async (req, res) => {
 
           /* 其他非文字類型（含貼圖） */
           if (e.message.type !== 'text') {
-            // ★ 若正在 GPT 排隊：任何非文字都算洗版
             if (st.gptQueued) {
-              const wasQueuedAlready = true
-              const r = handleQueuedAntiSpam(st, wasQueuedAlready)
+              const r = handleQueuedAntiSpam(st, true)
               if (r.replyText) await replyWithGreetingIfNeeded(st, e.replyToken, r.replyText, meta)
               return
             }
@@ -956,6 +959,14 @@ app.post('/webhook', async (req, res) => {
             return
           }
 
+          // ★ 發票：固定導去問與答（不要求訂單、不走 GPT）
+          // 但若同一句其實是領貨意圖（已付款/取貨等），仍讓領貨優先
+          if (st.state === 'WAIT_ORDER' && hasInvoiceIntent(t) && !hasPickupIntent(t)) {
+            await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.invoiceFaq, meta)
+            return
+          }
+
+          // WAIT_ORDER：純 5 位數（永遠有效）
           if (st.state === 'WAIT_ORDER' && isPureFiveDigits(t)) {
             st.order = t.trim()
             st.state = 'WAIT_PROOF'
@@ -964,6 +975,17 @@ app.post('/webhook', async (req, res) => {
             return
           }
 
+          // ★★ 先 KB（很重要）：避免「領貨/取貨」問法被流程吃掉，看不到 KB
+          if (st.state === 'WAIT_ORDER') {
+            const hits = kbTopK(t, 4)
+            if (hits.length) {
+              unqueueUser(uid, st)
+              await replyWithGreetingIfNeeded(st, e.replyToken, hits[0].answer || TEXT.busy, meta)
+              return
+            }
+          }
+
+          // WAIT_ORDER：領貨意圖才抽訂單（KB 沒命中才走這段）
           if (st.state === 'WAIT_ORDER' && hasPickupIntent(t)) {
             const extracted = extractOrderCandidate(t)
             if (extracted) {
@@ -978,13 +1000,14 @@ app.post('/webhook', async (req, res) => {
           }
 
           /* ===== 一般問題：KB → 否則 GPT（含排隊/反洗版） ===== */
-
-          // KB 命中：直接回 KB（不走 GPT、不排隊）
-          const hits = kbTopK(t, 4)
-          if (hits.length) {
-            unqueueUser(uid, st)
-            await replyWithGreetingIfNeeded(st, e.replyToken, hits[0].answer || TEXT.busy, meta)
-            return
+          //（這裡再跑一次 KB：給非 WAIT_ORDER 或漏網情況）
+          {
+            const hits = kbTopK(t, 4)
+            if (hits.length) {
+              unqueueUser(uid, st)
+              await replyWithGreetingIfNeeded(st, e.replyToken, hits[0].answer || TEXT.busy, meta)
+              return
+            }
           }
 
           if (!OPENAI_API_KEY) {
@@ -992,14 +1015,12 @@ app.post('/webhook', async (req, res) => {
             return
           }
 
-          // ★ 若他本來就在排隊：不管目前是否有空位，都維持排隊規則（A 方案）
           if (st.gptQueued) {
             const r = handleQueuedAntiSpam(st, true)
             if (r.replyText) await replyWithGreetingIfNeeded(st, e.replyToken, r.replyText, meta)
             return
           }
 
-          // 併發滿了 → 排隊（並且這次訊息也算洗版）
           if (gptActive >= GPT_MAX_CONCURRENT) {
             const wasQueued = !!st.gptQueued
             queueUserForGpt(uid, st)
@@ -1008,7 +1029,6 @@ app.post('/webhook', async (req, res) => {
             return
           }
 
-          // ★ 原子占位：避免同時放行超過 5
           if (!tryAcquireGptSlot()) {
             const wasQueued = !!st.gptQueued
             queueUserForGpt(uid, st)
@@ -1017,7 +1037,6 @@ app.post('/webhook', async (req, res) => {
             return
           }
 
-          // GPT 有空位：解除排隊狀態（避免殘留）
           unqueueUser(uid, st)
 
           try {
@@ -1050,7 +1069,6 @@ function rebuildGptQueueFromStore() {
     if (!st) continue
     if (!st.gptQueued) continue
     if (isManual(st)) continue
-    // ★ 不要跳過 cooldown：重啟後仍要保留在隊列，等冷卻結束再輪到
     if (!gptQueuedSet.has(uid)) {
       gptQueuedSet.add(uid)
       gptWaitQueue.push(uid)
