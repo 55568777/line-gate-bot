@@ -12,30 +12,30 @@ const {
 
 app.use(express.json({ verify: verifyLine }))
 
-/* ========= 基本工具 ========= */
+/* ===== 驗簽 ===== */
 function verifyLine(req, res, buf) {
   const sig = crypto.createHmac('sha256', CHANNEL_SECRET).update(buf).digest('base64')
   if (sig !== req.headers['x-line-signature']) throw new Error('Bad signature')
 }
 
-function isFiveDigits(t) {
-  return /^\d{5}$/.test(t)
+/* ===== 工具 ===== */
+function isPureFiveDigits(t) {
+  return /^\d{5}$/.test(t.trim())
 }
-
 function isValidUserId(u) {
   return typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u)
 }
 
-/* ========= 文案 ========= */
+/* ===== 文案 ===== */
 const TEXT = {
   askOrder: '請提供【5 位數訂單編號】。',
   askProof: '請上傳【付款明細截圖】（圖片）。',
   done: '資料已收齊，核對中；未通知前請勿重複詢問。',
 }
 
-/* ========= 狀態 ========= */
+/* ===== 狀態 ===== */
 const store = new Map()
-// state: WAIT_ORDER → WAIT_PROOF → DONE
+// WAIT_ORDER → WAIT_PROOF → DONE
 function getState(uid) {
   if (!store.has(uid)) {
     store.set(uid, { state: 'WAIT_ORDER', order: null, pushed: false })
@@ -43,7 +43,7 @@ function getState(uid) {
   return store.get(uid)
 }
 
-/* ========= LINE API ========= */
+/* ===== LINE API ===== */
 async function reply(replyToken, text) {
   await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
@@ -85,7 +85,7 @@ async function getProfile(uid) {
   }
 }
 
-/* ========= GPT 客服 ========= */
+/* ===== GPT 客服 ===== */
 async function gptReply(userText) {
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -100,7 +100,7 @@ async function gptReply(userText) {
         {
           role: 'system',
           content:
-`你是官方客服。語氣冷靜、專業、簡短。
+`你是官方客服，語氣冷靜、專業、簡短。
 你不能確認訂單、不能說已完成、不能說已收齊。
 若提到領貨，一律指示：提供 5 位數訂單編號，再上傳付款截圖。`,
         },
@@ -112,7 +112,7 @@ async function gptReply(userText) {
   return j.choices?.[0]?.message?.content || '請依流程提供資料。'
 }
 
-/* ========= Webhook ========= */
+/* ===== Webhook ===== */
 app.post('/webhook', async (req, res) => {
   try {
     for (const e of req.body?.events || []) {
@@ -121,7 +121,7 @@ app.post('/webhook', async (req, res) => {
       const uid = e.source?.userId
       const st = getState(uid)
 
-      /* === 圖片：一定是領貨 === */
+      /* === 圖片一定是領貨 === */
       if (e.message.type === 'image') {
         if (st.state === 'WAIT_ORDER') {
           await reply(e.replyToken, TEXT.askOrder)
@@ -151,25 +151,33 @@ app.post('/webhook', async (req, res) => {
       if (e.message.type === 'text') {
         const t = e.message.text.trim()
 
-        // 5 位數 → 領貨
-        if (isFiveDigits(t)) {
+        // （你專用）重置流程
+        if (t === '#reset') {
+          store.delete(uid)
+          await reply(e.replyToken, '流程已重置。')
+          continue
+        }
+
+        // 純 5 位數 → 領貨
+        if (isPureFiveDigits(t)) {
           st.order = t
           st.state = 'WAIT_PROOF'
           await reply(e.replyToken, TEXT.askProof)
           continue
         }
 
-        // 已在流程中 → 領貨回覆
+        // 已在領貨流程中 → 不給 GPT
         if (st.state !== 'WAIT_ORDER') {
           await reply(e.replyToken, TEXT.askProof)
           continue
         }
 
-        // 其他 → GPT 客服
+        // 其他純文字 → GPT 客服
         const ans = await gptReply(t)
         await reply(e.replyToken, ans)
       }
     }
+
     res.sendStatus(200)
   } catch (err) {
     console.error(err)
