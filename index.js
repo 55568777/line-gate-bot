@@ -11,15 +11,15 @@ const {
   CHANNEL_SECRET,
   ADMIN_USER_ID,
   OPENAI_API_KEY,
+  OPENAI_MODEL, // 可選：不設就用 gpt-4o
 } = process.env
 
-/* ===== 必要環境檢查（避免 verifyLine 直接炸） ===== */
+/* ===== 必要環境檢查 ===== */
 function requireEnv() {
   const missing = []
   if (!CHANNEL_ACCESS_TOKEN) missing.push('CHANNEL_ACCESS_TOKEN')
   if (!CHANNEL_SECRET) missing.push('CHANNEL_SECRET')
   if (!ADMIN_USER_ID) missing.push('ADMIN_USER_ID')
-  // OPENAI_API_KEY 可選：沒設就不走 GPT
   if (missing.length) {
     console.error('[FATAL] Missing env:', missing.join(', '))
     process.exit(1)
@@ -46,18 +46,32 @@ app.use(express.json({ verify: verifyLine }))
 /* ===== 常數 ===== */
 const MANUAL_TTL_MS = 60 * 60 * 1000
 const MANUAL_PING_COOLDOWN_MS = 2 * 60 * 1000
-const STATE_TTL_MS = 24 * 60 * 60 * 1000          // WAIT_ORDER / WAIT_PROOF 24h 過期
-const DEDUPE_TTL_MS = 10 * 60 * 1000              // 事件去重 10m
-const PROFILE_TTL_MS = 24 * 60 * 60 * 1000        // profile 快取 24h
-const OPENAI_TIMEOUT_MS = 8000                    // GPT 超時
+
+const WAIT_ORDER_TTL_MS = 24 * 60 * 60 * 1000
+const WAIT_PROOF_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+const DEDUPE_TTL_MS = 10 * 60 * 1000
+const PROFILE_TTL_MS = 24 * 60 * 60 * 1000
+const OPENAI_TIMEOUT_MS = 8000
 const KB_WATCH_DEBOUNCE_MS = 250
 
-// ===== 久未互動再打招呼（你可改天數）=====
-const GREET_IDLE_MS = 7 * 24 * 60 * 60 * 1000     // 7 天沒互動就再打招呼
-const GREETING_TEXT = `Yuyi 機器人客服
-本帳號為自動客服系統，
-負責引導領貨流程與一般問題回覆，
-實際核對將由人工處理。`
+const GREET_IDLE_MS = 7 * 24 * 60 * 60 * 1000
+const GREETING_TEXT = `Yuyi 機器人客服｜自動回覆系統（必要時轉真人）`
+
+// ===== GPT 併發/排隊/反洗版（標準）=====
+const GPT_MAX_CONCURRENT = 5
+const GPT_QUEUE_REMIND_MS = 60 * 1000
+const GPT_COOLDOWN_MS = 5 * 60 * 1000
+const SPAM30_THRESHOLD = 6
+const SPAM120_THRESHOLD = 15
+const SPAM120_HARD_THRESHOLD = 40
+
+// ===== B1：狀態持久化（state.json）=====
+const STATE_PATH = path.resolve(process.cwd(), 'state.json')
+const STATE_FLUSH_DEBOUNCE_MS = 900
+const STATE_FLUSH_INTERVAL_MS = 10_000
+const PRUNE_AFTER_MS = 10 * 24 * 60 * 60 * 1000
+const MAX_USERS = 10_000
 
 /* ===== KB（kb.json TopK 檢索 + 熱更新 + 原子更新） ===== */
 const KB_PATH = path.resolve(process.cwd(), 'kb.json')
@@ -73,7 +87,6 @@ function loadKBAtomic() {
     KB = parsed
     console.log(`[KB] loaded ${KB.length} items`)
   } catch (e) {
-    // 失敗不清空 KB，保留舊資料避免瞬間變空
     console.error('[KB] reload failed (keep old):', e.message)
   }
 }
@@ -90,59 +103,54 @@ try {
   })
 } catch (_) {}
 
+/* ===== KB 命中更嚴格 ===== */
 function kbScore(query, item) {
   const q = norm(query)
-  if (!q) return 0
+  if (!q) return { score: 0, ratio: 0, strong: false }
 
-  const hay = norm(
-    [
-      ...(item.questions || []),
-      item.answer || '',
-      ...(item.tags || []),
-    ].join(' ')
-  )
+  const qs = (item.questions || []).map(norm)
+  const ans = norm(item.answer || '')
+  const tags = (item.tags || []).map(norm)
 
-  // 避免短 query 過度命中
-  if (q.length >= 6 && hay.includes(q)) return 999
+  if (q.length >= 4 && qs.some(x => x.includes(q))) {
+    return { score: 999, ratio: 1, strong: true }
+  }
 
-  const words = q
-    .split(/[^a-z0-9\u4e00-\u9fff]+/i)
-    .filter(Boolean)
+  const hay = norm([...qs, ans, ...tags].join(' '))
+  const words = q.split(/[^a-z0-9\u4e00-\u9fff]+/i).filter(Boolean)
+  if (!words.length) return { score: 0, ratio: 0, strong: false }
 
   let hit = 0
   for (const w of words) {
     if (w.length >= 2 && hay.includes(w)) hit++
   }
-  return hit
+
+  const ratio = hit / Math.max(words.length, 1)
+  return { score: hit, ratio, strong: false }
 }
 
-function kbTopK(query, k = 4, minScore = 2) {
+function kbTopK(query, k = 4) {
   const ranked = KB
-    .map(it => ({ it, s: kbScore(query, it) }))
-    .filter(x => x.s > 0)
-    .sort((a, b) => b.s - a.s)
+    .map(it => {
+      const r = kbScore(query, it)
+      return { it, ...r }
+    })
+    .filter(x => x.score > 0)
+    .sort((a, b) => (b.strong - a.strong) || (b.score - a.score) || (b.ratio - a.ratio))
     .slice(0, k)
 
-  const best = ranked[0]?.s || 0
-  if (best !== 999 && best < minScore) return []
-  return ranked.map(x => x.it)
-}
+  const best = ranked[0]
+  if (!best) return []
 
-function kbToContext(items) {
-  return items
-    .map(it => {
-      const qs = (it.questions || []).slice(0, 6).join(' / ')
-      const links = (it.links || []).length
-        ? `\nLinks:\n- ${(it.links || []).join('\n- ')}`
-        : ''
-      return `【KB】${it.id || ''}\nQ: ${qs}\nA: ${it.answer || ''}${links}`.trim()
-    })
-    .join('\n\n')
+  if (best.strong) return ranked.map(x => x.it)
+  if (best.score >= 3 && best.ratio >= 0.6) return ranked.map(x => x.it)
+
+  return []
 }
 
 /* ===== 工具 ===== */
 const now = () => Date.now()
-const isPureFiveDigits = t => /^\d{5}$/.test((t || '').trim())
+const isPureFiveDigits = t => /^\s*\d{5}\s*$/.test(String(t || ''))
 const isValidUserId = u => typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u)
 
 function briefOfMessage(e) {
@@ -156,6 +164,15 @@ function briefOfMessage(e) {
   return '[未知]'
 }
 
+function tzTimeHHMM(ts = Date.now()) {
+  return new Intl.DateTimeFormat('zh-TW', {
+    timeZone: 'Asia/Taipei',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(new Date(ts))
+}
+
 /* ===== 領貨意圖判斷 ===== */
 function hasPickupIntent(t) {
   const s = (t || '').trim()
@@ -165,48 +182,97 @@ function hasPickupIntent(t) {
   ]
   if (exclude.some(k => s.includes(k))) return false
 
-  const include = [
-    '已付款', '付款了', '轉帳', '匯款', '繳費', '刷卡',
+  const strong = [
+    '已付款', '付款了', '轉帳', '匯款', '繳費', '刷卡', '扣款',
     '領貨', '取貨', '拿貨',
-    '出貨', '發貨', '寄了', '到了沒',
-    '序號', '點數', '卡',
-    '沒收到', '幫我查', '查訂單',
+    '出貨', '發貨', '寄了', '到了沒', '沒收到',
   ]
-  return include.some(k => s.includes(k))
+  const weak = ['幫我查', '查訂單', '查一下', '查詢']
+
+  const hasStrong = strong.some(k => s.includes(k))
+  if (hasStrong) return true
+  if (weak.some(k => s.includes(k))) return false
+
+  const other = ['序號', '點數', '卡']
+  return other.some(k => s.includes(k))
+}
+
+/* ===== 取消/重來/傳錯 ===== */
+function hasResetIntent(t = '') {
+  const s = String(t).trim()
+  const keys = [
+    '取消', '重來', '重做', '重新', '重啟',
+    '傳錯', '傳錯了', '發錯', '貼錯',
+    '重傳', '再傳', '改一下', '換一張',
+  ]
+  return keys.some(k => s.includes(k))
 }
 
 /* ===== 文案 ===== */
 const TEXT = {
-  askOrder: '請提供【5 位數訂單編號】。',
-  askProof: '請上傳【付款明細截圖】（圖片）。',
-  done: '資料已收齊，交由真人客服核對中；未通知前請勿重複詢問。',
-  needText: '請用文字描述問題或提供訂單流程所需資料。',
+  askOrder: '若要領貨，請提供【5 位數訂單編號】。',
+  askProof:
+`請上傳【付款明細截圖】（圖片）。
+超商：紙本單據／轉帳：網銀轉帳紀錄／刷卡：扣款通知或網銀紀錄／電子支付：錢包消費紀錄。`,
+  proofNote: '已收到補充說明，仍請上傳【付款明細截圖】即可。',
+  done: '資料已收齊，將由真人客服核對；如需補件會再通知，請稍候。',
+  needText: '一般問題請用文字描述；若要領貨，請先提供【5 位數訂單編號】。',
   busy: '客服系統暫時忙碌，請稍後再試。',
+  imageNoText: '若要領貨，請先提供【5 位數訂單編號】；一般問題請用文字說明。',
+
+  queueEnter:
+`機器人目前正在處理其他用戶，
+已幫您排隊，請勿洗版，輪到您會主動通知。`,
+  queueStill: '您已在排隊中，請耐心等候，輪到您會通知。',
+  queueStrong:
+`偵測到重複訊息，為維護服務品質，
+排隊期間請勿洗版；輪到您會通知。`,
+  queueReady: '已輪到您，請直接把問題再傳一次，我會立刻處理。',
+  cooldown:
+`您訊息過於頻繁，系統已進入短暫冷卻以維護服務品質；
+請稍後再傳，輪到您會通知。`,
 }
 
-/* ===== 狀態（RAM + TTL） ===== */
+/* ===== 狀態（RAM + B1 持久化） ===== */
 const store = new Map()
-function getState(uid) {
-  if (!store.has(uid)) {
-    store.set(uid, {
-      state: 'WAIT_ORDER',
-      order: null,
-      proofMessageId: null,
-      proofAt: 0,
-      pushed: false,
 
-      manualUntil: 0,
-      _lastManualPingAt: 0,
-      _manualBurstCount: 0,
-      _manualLastBrief: '',
+function defaultState() {
+  return {
+    state: 'WAIT_ORDER',
+    order: null,
 
-      updatedAt: now(),
+    proofMessageId: null,
+    proofAt: 0,
+    pushed: false,
 
-      // ===== 開場白（久未互動再送）=====
-      lastSeenAt: 0,
-      lastGreetAt: 0,
-    })
+    manualUntil: 0,
+    _lastManualPingAt: 0,
+    _manualBurstCount: 0,
+    _manualLastBrief: '',
+
+    updatedAt: now(),
+
+    lastSeenAt: 0,
+    lastGreetAt: 0,
+
+    _lastPresenceFlushAt: 0,
+
+    // ===== GPT 排隊/反洗版（持久化）=====
+    gptQueued: false,
+    gptQueuedAt: 0,
+    gptLastQueueReplyAt: 0,
+    gptReadyNotifiedAt: 0,
+
+    cooldownUntil: 0,
+    cooldownNotifiedAt: 0, // ★ 冷卻提示只顯示一次
+
+    spam30Start: 0, spam30Count: 0,
+    spam120Start: 0, spam120Count: 0,
   }
+}
+
+function getState(uid) {
+  if (!store.has(uid)) store.set(uid, defaultState())
   return store.get(uid)
 }
 
@@ -219,22 +285,38 @@ function resetState(st) {
   st.updatedAt = now()
 }
 
-function touch(st) { st.updatedAt = now() }
+function touch(st) {
+  st.updatedAt = now()
+}
+
+function markDirty(st) {
+  st.updatedAt = now()
+  scheduleFlush()
+}
 
 function expireIfNeeded(st) {
   if (!st.updatedAt) st.updatedAt = now()
-  if (now() - st.updatedAt > STATE_TTL_MS) {
+  const idle = now() - st.updatedAt
+
+  if (st.state === 'WAIT_ORDER' && idle > WAIT_ORDER_TTL_MS) {
     resetState(st)
+    scheduleFlush()
+    return
+  }
+
+  if (st.state === 'WAIT_PROOF' && idle > WAIT_PROOF_TTL_MS) {
+    resetState(st)
+    scheduleFlush()
+    return
   }
 }
 
 function isManual(st) {
   if (!st.manualUntil) return false
   if (st.manualUntil > now()) return true
-
-  // 人工期結束 → 重置
+  // ★ 人工期結束：只清 manual，不要硬 reset 流程（避免 DONE 被清空）
   st.manualUntil = 0
-  resetState(st)
+  markDirty(st)
   return false
 }
 
@@ -243,17 +325,102 @@ function setManual(st) {
   st._lastManualPingAt = 0
   st._manualBurstCount = 0
   st._manualLastBrief = ''
-  touch(st)
+  markDirty(st)
 }
 
+/* ===== B1：載入/寫入 state.json ===== */
+let _flushTimer = null
+let _dirty = false
+
+function scheduleFlush() {
+  _dirty = true
+  if (_flushTimer) return
+  _flushTimer = setTimeout(() => {
+    _flushTimer = null
+    flushStateToDisk()
+  }, STATE_FLUSH_DEBOUNCE_MS)
+}
+
+function pruneStore() {
+  const n = now()
+
+  for (const [uid, st] of store) {
+    const last = st.lastSeenAt || st.updatedAt || 0
+    if (last && (n - last > PRUNE_AFTER_MS)) store.delete(uid)
+  }
+
+  if (store.size > MAX_USERS) {
+    const arr = []
+    for (const [uid, st] of store) {
+      const last = st.lastSeenAt || st.updatedAt || 0
+      arr.push([uid, last])
+    }
+    arr.sort((a, b) => a[1] - b[1])
+    const needDrop = store.size - MAX_USERS
+    for (let i = 0; i < needDrop; i++) store.delete(arr[i][0])
+  }
+}
+
+function flushStateToDisk() {
+  if (!_dirty) return
+  _dirty = false
+  try {
+    pruneStore()
+    const obj = Object.create(null)
+    for (const [uid, st] of store) obj[uid] = st
+
+    const tmp = `${STATE_PATH}.tmp`
+    const data = JSON.stringify(obj)
+
+    const fd = fs.openSync(tmp, 'w')
+    try {
+      fs.writeFileSync(fd, data, 'utf8')
+      fs.fsyncSync(fd)
+    } finally {
+      fs.closeSync(fd)
+    }
+
+    fs.renameSync(tmp, STATE_PATH)
+  } catch (e) {
+    console.error('[STATE] flush failed:', e.message)
+  }
+}
+
+function loadStateFromDisk() {
+  try {
+    if (!fs.existsSync(STATE_PATH)) return
+    const raw = fs.readFileSync(STATE_PATH, 'utf8')
+    const data = JSON.parse(raw)
+    if (!data || typeof data !== 'object') return
+    for (const [uid, st] of Object.entries(data)) {
+      if (!isValidUserId(uid)) continue
+      if (!st || typeof st !== 'object') continue
+      store.set(uid, { ...defaultState(), ...st })
+    }
+    pruneStore()
+    console.log(`[STATE] loaded ${store.size} users`)
+  } catch (e) {
+    console.error('[STATE] load failed:', e.message)
+  }
+}
+
+setInterval(() => flushStateToDisk(), STATE_FLUSH_INTERVAL_MS).unref?.()
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => {
+    try { flushStateToDisk() } catch {}
+    process.exit(0)
+  })
+}
+loadStateFromDisk()
+
 /* ===== 事件去重 ===== */
-const dedupe = new Map() // key -> ts
+const dedupe = new Map()
 function dedupeKey(e) {
   const uid = e?.source?.userId || ''
   const mid = e?.message?.id || ''
-  const rt = e?.replyToken || ''
   const ts = e?.timestamp || ''
-  return `${uid}|${mid}|${rt}|${ts}`
+  const rt = e?.replyToken || ''
+  return `${uid}|${mid}|${ts}|${rt}`
 }
 function isDup(key) {
   const t = dedupe.get(key)
@@ -264,18 +431,15 @@ function isDup(key) {
 }
 setInterval(() => {
   const n = now()
-  for (const [k, t] of dedupe) {
-    if (n - t > DEDUPE_TTL_MS) dedupe.delete(k)
-  }
+  for (const [k, t] of dedupe) if (n - t > DEDUPE_TTL_MS) dedupe.delete(k)
 }, 60_000).unref?.()
 
 /* ===== Profile 快取 ===== */
-const profileCache = new Map() // uid -> { data, at }
+const profileCache = new Map()
 async function getProfile(uid) {
   try {
     const c = profileCache.get(uid)
     if (c && (now() - c.at) < PROFILE_TTL_MS) return c.data
-
     const r = await fetch(`https://api.line.me/v2/bot/profile/${uid}`, {
       headers: { Authorization: `Bearer ${CHANNEL_ACCESS_TOKEN}` },
     })
@@ -289,17 +453,46 @@ async function getProfile(uid) {
 }
 
 /* ===== LINE API ===== */
-async function reply(replyToken, text) {
-  if (!replyToken) return
+async function replyMany(replyToken, texts = [], meta = {}) {
+  const arr = (texts || []).filter(Boolean).slice(0, 5)
+  if (!replyToken || arr.length === 0) return
   const r = await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${CHANNEL_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({ replyToken, messages: [{ type: 'text', text }] }),
+    body: JSON.stringify({
+      replyToken,
+      messages: arr.map(t => ({ type: 'text', text: t })),
+    }),
   })
-  if (!r.ok) console.error('LINE reply fail', r.status, await r.text())
+  if (!r.ok) {
+    const body = await r.text().catch(() => '')
+    console.error('LINE reply fail', r.status, body, meta)
+  }
+}
+
+function maybeFlushPresence(st) {
+  const n = now()
+  if (!st._lastPresenceFlushAt || (n - st._lastPresenceFlushAt > 10 * 60 * 1000)) {
+    st._lastPresenceFlushAt = n
+    scheduleFlush()
+  }
+}
+
+async function replyWithGreetingIfNeeded(st, replyToken, mainText, meta = {}) {
+  const n = now()
+  const idleTooLong = st.lastSeenAt && (n - st.lastSeenAt > GREET_IDLE_MS)
+  st.lastSeenAt = n
+
+  const needGreet = (st.lastGreetAt === 0 || idleTooLong)
+  if (needGreet) st.lastGreetAt = n
+
+  maybeFlushPresence(st)
+
+  if (needGreet) return replyMany(replyToken, [GREETING_TEXT, mainText], meta)
+  return replyMany(replyToken, [mainText], meta)
 }
 
 async function push(to, text) {
@@ -315,52 +508,8 @@ async function push(to, text) {
   if (!r.ok) console.error('LINE push fail', r.status, await r.text())
 }
 
-/* ===== GPT（KB 命中→只回KB；否則 GPT；含 timeout） ===== */
-async function gptReply(userText) {
-  if (!OPENAI_API_KEY) return TEXT.busy
-
-  const hits = kbTopK(userText, 4, 2)
-  if (hits.length) return hits[0].answer || TEXT.busy
-
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS)
-
-  try {
-    const messages = [
-      {
-        role: 'system',
-        content:
-          '你是官方客服，語氣冷靜、專業、簡短。若提到領貨，一律指示提供 5 位數訂單編號與付款截圖。若有知識庫答案則必須遵守；沒有才自由回答。',
-      },
-      { role: 'user', content: userText },
-    ]
-
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        temperature: 0.3,
-        messages,
-      }),
-      signal: controller.signal,
-    })
-
-    if (!r.ok) return TEXT.busy
-    const j = await r.json()
-    return j.choices?.[0]?.message?.content || TEXT.busy
-  } catch {
-    return TEXT.busy
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
-/* ===== 同客戶序列化（避免競態） ===== */
-const userQueue = new Map() // uid -> Promise
+/* ===== 同客戶序列化 ===== */
+const userQueue = new Map()
 function enqueue(uid, fn) {
   const prev = userQueue.get(uid) || Promise.resolve()
   const next = prev
@@ -373,129 +522,541 @@ function enqueue(uid, fn) {
   return next
 }
 
+/* ===== 訂單抽取 ===== */
+function extractOrderCandidate(text) {
+  const s = String(text || '').trim()
+  if (!s) return null
+
+  if (/^\d{5}$/.test(s)) return s
+
+  const hasLongDigitRun = /\d{7,}/.test(s)
+  const m = s.match(/(?:^|[^\d])(\d{5})(?:[^\d]|$)/)
+  if (!m) return null
+  const five = m[1]
+
+  const keywordNear = (() => {
+    const idx = s.indexOf(five)
+    if (idx < 0) return false
+    const left = Math.max(0, idx - 10)
+    const right = Math.min(s.length, idx + five.length + 10)
+    const window = s.slice(left, right)
+    return /(訂單|單號|編號|訂單號|order)/i.test(window)
+  })()
+  if (keywordNear) return five
+
+  if (hasLongDigitRun) return null
+  return five
+}
+
+/* ===== GPT：併發/排隊/反洗版 ===== */
+let gptActive = 0
+
+// ★ 用「head index」避免 shift 造成慢與殘留成本
+const gptWaitQueue = []
+let gptWaitHead = 0
+const gptQueuedSet = new Set()
+
+function queueUserForGpt(uid, st) {
+  if (st.gptQueued && gptQueuedSet.has(uid)) return
+  st.gptQueued = true
+  st.gptQueuedAt = now()
+  st.gptReadyNotifiedAt = 0
+  if (!gptQueuedSet.has(uid)) {
+    gptQueuedSet.add(uid)
+    gptWaitQueue.push(uid)
+  }
+  markDirty(st)
+}
+
+function unqueueUser(uid, st) {
+  st.gptQueued = false
+  st.gptQueuedAt = 0
+  st.gptReadyNotifiedAt = 0
+  gptQueuedSet.delete(uid)
+  markDirty(st)
+}
+
+function compactQueueIfNeeded() {
+  if (gptWaitHead > 200 && gptWaitHead * 2 > gptWaitQueue.length) {
+    gptWaitQueue.splice(0, gptWaitHead)
+    gptWaitHead = 0
+  }
+}
+
+async function notifyNextQueuedUsers() {
+  const slots = Math.max(0, GPT_MAX_CONCURRENT - gptActive)
+  if (slots <= 0) return
+
+  let notified = 0
+  const n = now()
+
+  while (notified < slots && gptWaitHead < gptWaitQueue.length) {
+    const uid = gptWaitQueue[gptWaitHead++]
+    if (!uid) break
+
+    // 這個 uid 已被解除排隊 → stale，跳過
+    if (!gptQueuedSet.has(uid)) continue
+    gptQueuedSet.delete(uid)
+
+    const st = store.get(uid)
+    if (!st) continue
+
+    // 人工期不通知
+    if (isManual(st)) { unqueueUser(uid, st); continue }
+
+    // 冷卻中：保留排隊資格，但不通知（放回隊列尾巴）
+    if (st.cooldownUntil && st.cooldownUntil > n) {
+      queueUserForGpt(uid, st)
+      continue
+    }
+
+    if (!st.gptQueued) continue
+
+    // 節流：避免短時間重複 push
+    if (st.gptReadyNotifiedAt && (n - st.gptReadyNotifiedAt) < 2 * 60 * 1000) {
+      queueUserForGpt(uid, st)
+      continue
+    }
+
+    // A 方案：通知後先退出「排隊中」，等待他再發一次問題
+    st.gptQueued = false
+    st.gptReadyNotifiedAt = n
+    markDirty(st)
+
+    await push(uid, TEXT.queueReady)
+    notified++
+  }
+
+  compactQueueIfNeeded()
+}
+
+function onGptFinished() {
+  notifyNextQueuedUsers().catch(() => {})
+}
+
+// ★ 原子占位：避免「同時進來」超過 5
+function tryAcquireGptSlot() {
+  if (gptActive >= GPT_MAX_CONCURRENT) return false
+  gptActive++
+  return true
+}
+function releaseGptSlot() {
+  gptActive = Math.max(0, gptActive - 1)
+  onGptFinished()
+}
+
+/* ===== 排隊/冷卻：反洗版（任何訊息都算） ===== */
+function bumpSpamCounters(st) {
+  const n = now()
+
+  if (!st.spam30Start || (n - st.spam30Start > 30 * 1000)) {
+    st.spam30Start = n
+    st.spam30Count = 0
+  }
+  st.spam30Count++
+
+  if (!st.spam120Start || (n - st.spam120Start > 120 * 1000)) {
+    st.spam120Start = n
+    st.spam120Count = 0
+  }
+  st.spam120Count++
+
+  markDirty(st)
+}
+
+function shouldReplyQueueMessage(st, ms = GPT_QUEUE_REMIND_MS) {
+  const n = now()
+  if (!st.gptLastQueueReplyAt || (n - st.gptLastQueueReplyAt > ms)) {
+    st.gptLastQueueReplyAt = n
+    markDirty(st)
+    return true
+  }
+  return false
+}
+
+function enterCooldown(st) {
+  const n = now()
+  st.cooldownUntil = n + GPT_COOLDOWN_MS
+  st.cooldownNotifiedAt = 0 // ★ 冷卻訊息「尚未提示」
+  st.gptQueued = false
+  st.gptQueuedAt = 0
+  st.gptReadyNotifiedAt = 0
+  st.gptLastQueueReplyAt = n
+  markDirty(st)
+}
+
+// ★ 冷卻到期自動清掉（避免殘留）
+function normalizeCooldown(st) {
+  if (st.cooldownUntil && st.cooldownUntil <= now()) {
+    st.cooldownUntil = 0
+    st.cooldownNotifiedAt = 0
+    markDirty(st)
+  }
+}
+
+/*
+  ★ 排隊中任何訊息都要算洗版（含貼圖/圖片/其他）
+  回傳：{ handled: boolean, replyText: string|null }
+*/
+function handleQueuedAntiSpam(st, wasQueuedAlready) {
+  bumpSpamCounters(st)
+
+  if (st.spam120Count >= SPAM120_HARD_THRESHOLD) {
+    enterCooldown(st)
+    return { handled: true, replyText: TEXT.cooldown, cooldownOnce: true }
+  }
+
+  const strongWarn = (st.spam30Count >= SPAM30_THRESHOLD) || (st.spam120Count >= SPAM120_THRESHOLD)
+
+  if (shouldReplyQueueMessage(st)) {
+    if (!wasQueuedAlready) return { handled: true, replyText: TEXT.queueEnter }
+    return { handled: true, replyText: strongWarn ? TEXT.queueStrong : TEXT.queueStill }
+  }
+
+  return { handled: true, replyText: null }
+}
+
+/* ===== GPT：Responses API + timeout（不在這裡增減 gptActive） ===== */
+async function gptReplyDirect(userText) {
+  if (!OPENAI_API_KEY) return TEXT.busy
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS)
+
+  try {
+    const input = [
+      {
+        role: 'system',
+        content:
+          '你是官方客服，語氣冷靜、專業、簡短。若提到領貨，一律指示提供 5 位數訂單編號與付款截圖。若有知識庫答案則必須遵守；沒有才自由回答。',
+      },
+      { role: 'user', content: userText },
+    ]
+
+    const r = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL || 'gpt-4o',
+        temperature: 0.3,
+        input,
+      }),
+      signal: controller.signal,
+    })
+
+    if (!r.ok) return TEXT.busy
+    const j = await r.json()
+
+    const out =
+      j.output_text ||
+      j.output?.[0]?.content?.find?.(c => c.type === 'output_text')?.text ||
+      ''
+
+    return out || TEXT.busy
+  } catch {
+    return TEXT.busy
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /* ===== Webhook ===== */
-app.post('/webhook', (req, res) => {
+app.post('/webhook', async (req, res) => {
   if (req._badSig) return res.sendStatus(401)
 
-  // 先回 200，避免 LINE 重送
-  res.sendStatus(200)
+  let responded = false
+  const safeRespond = (code = 200) => {
+    if (responded) return
+    responded = true
+    res.sendStatus(code)
+  }
 
-  const events = req.body?.events || []
-  for (const e of events) {
-    if (e.type !== 'message' || e.source?.type !== 'user') continue
+  const timer = setTimeout(() => safeRespond(200), 900)
 
-    const key = dedupeKey(e)
-    if (isDup(key)) continue
+  try {
+    const events = req.body?.events || []
+    const jobs = []
 
-    const uid = e.source.userId
+    for (const e of events) {
+      if (e.type !== 'message' || e.source?.type !== 'user') continue
 
-    enqueue(uid, async () => {
-      const st = getState(uid)
-      expireIfNeeded(st)
+      const key = dedupeKey(e)
+      if (isDup(key)) continue
 
-      // ===== 久未互動先打招呼（且本次不進流程）=====
-      const n = now()
-      const idleTooLong = st.lastSeenAt && (n - st.lastSeenAt > GREET_IDLE_MS)
-      st.lastSeenAt = n
+      const uid = e.source.userId
 
-      // 人工期不打招呼（避免干擾）
-      if (!isManual(st) && (st.lastGreetAt === 0 || idleTooLong)) {
-        st.lastGreetAt = n
-        await reply(e.replyToken, GREETING_TEXT)
-        return
-      }
+      jobs.push(
+        enqueue(uid, async () => {
+          const st = getState(uid)
+          expireIfNeeded(st)
+          normalizeCooldown(st)
 
-      /* 人工期：不回客，只彙整推播 */
-      if (isManual(st)) {
-        st._manualBurstCount++
-        st._manualLastBrief = briefOfMessage(e)
-        touch(st)
+          const meta = {
+            uid,
+            st: st.state,
+            order: st.order,
+            mid: e?.message?.id,
+            ts: e?.timestamp,
+          }
 
-        if (now() - st._lastManualPingAt > MANUAL_PING_COOLDOWN_MS) {
-          st._lastManualPingAt = now()
-          const profile = await getProfile(uid)
+          /* 人工期：不回客，只彙整推播 */
+          if (isManual(st)) {
+            st.lastSeenAt = now()
+            maybeFlushPresence(st)
 
-          await push(
-            ADMIN_USER_ID,
-            `人工期間新訊息（彙整）
-客人暱稱：${profile?.displayName || '未提供'}
+            st._manualBurstCount++
+            st._manualLastBrief = briefOfMessage(e)
+            touch(st)
+
+            if (now() - st._lastManualPingAt > MANUAL_PING_COOLDOWN_MS) {
+              st._lastManualPingAt = now()
+              const profile = await getProfile(uid)
+
+              await push(
+                ADMIN_USER_ID,
+                `人工期間新訊息（彙整）
+客人：${profile?.displayName || '未提供'}
 訂單：${st.order || '未填'}
-本段共：${st._manualBurstCount} 則
-最後：${st._manualLastBrief}`
-          )
+本段：${st._manualBurstCount} 則
+最後：${st._manualLastBrief}
+時間：${tzTimeHHMM(now())}`
+              )
 
-          st._manualBurstCount = 0
-          st._manualLastBrief = ''
-        }
-        return
-      }
+              st._manualBurstCount = 0
+              st._manualLastBrief = ''
+              markDirty(st)
+            }
+            return
+          }
 
-      /* 圖片訊息 */
-      if (e.message.type === 'image') {
-        if (st.state === 'WAIT_PROOF' && !st.pushed) {
-          st.proofMessageId = e.message.id || null
-          st.proofAt = now()
-          st.state = 'DONE'
-          st.pushed = true
+          /* ===== 冷卻中：只影響一般問題/GPT；領貨照走 ===== */
+          if (st.cooldownUntil && st.cooldownUntil > now()) {
+            // 先讓領貨流程繼續（文字才能走訂單）
+            if (e.message.type === 'text') {
+              const t0 = (e.message.text || '').trim()
+
+              if (st.state === 'WAIT_ORDER' && isPureFiveDigits(t0)) {
+                st.order = t0.trim()
+                st.state = 'WAIT_PROOF'
+                markDirty(st)
+                await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.askProof, meta)
+                return
+              }
+
+              if (st.state === 'WAIT_ORDER' && hasPickupIntent(t0)) {
+                const extracted = extractOrderCandidate(t0)
+                if (extracted) {
+                  st.order = extracted
+                  st.state = 'WAIT_PROOF'
+                  markDirty(st)
+                  await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.askProof, meta)
+                  return
+                }
+                await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.askOrder, meta)
+                return
+              }
+
+              if (st.state === 'WAIT_PROOF') {
+                await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.proofNote, meta)
+                return
+              }
+
+              if (st.state === 'DONE') {
+                await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.done, meta)
+                return
+              }
+            }
+
+            // 非領貨：冷卻提示只顯示一次
+            if (!st.cooldownNotifiedAt) {
+              st.cooldownNotifiedAt = now()
+              markDirty(st)
+              await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.cooldown, meta)
+            }
+            return
+          }
+
+          /* 圖片訊息 */
+          if (e.message.type === 'image') {
+            if (st.state === 'WAIT_PROOF' && !st.pushed) {
+              st.proofMessageId = e.message.id || null
+              st.proofAt = now()
+              st.state = 'DONE'
+              st.pushed = true
+              markDirty(st)
+
+              await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.done, meta)
+
+              setManual(st)
+
+              const profile = await getProfile(uid)
+              await push(
+                ADMIN_USER_ID,
+                `通關通知
+客人：${profile?.displayName || '未提供'}
+訂單：${st.order}
+付款圖ID：${st.proofMessageId || '未知'}`
+              )
+              return
+            }
+
+            // ★ 若正在 GPT 排隊：圖片也算洗版（但不影響領貨）
+            if (st.gptQueued) {
+              const wasQueuedAlready = true
+              const r = handleQueuedAntiSpam(st, wasQueuedAlready)
+              if (r.replyText) await replyWithGreetingIfNeeded(st, e.replyToken, r.replyText, meta)
+              return
+            }
+
+            touch(st)
+            await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.imageNoText, meta)
+            return
+          }
+
+          /* 其他非文字類型（含貼圖） */
+          if (e.message.type !== 'text') {
+            // ★ 若正在 GPT 排隊：任何非文字都算洗版
+            if (st.gptQueued) {
+              const wasQueuedAlready = true
+              const r = handleQueuedAntiSpam(st, wasQueuedAlready)
+              if (r.replyText) await replyWithGreetingIfNeeded(st, e.replyToken, r.replyText, meta)
+              return
+            }
+
+            let out = TEXT.needText
+            if (st.state === 'WAIT_PROOF') out = TEXT.askProof
+            else if (st.state === 'DONE') out = TEXT.done
+            touch(st)
+            await replyWithGreetingIfNeeded(st, e.replyToken, out, meta)
+            return
+          }
+
+          /* 文字 */
+          const t = (e.message.text || '').trim()
           touch(st)
 
-          await reply(e.replyToken, TEXT.done)
+          // 取消/重來/傳錯：WAIT_PROOF / DONE 直接回到 WAIT_ORDER
+          if ((st.state === 'WAIT_PROOF' || st.state === 'DONE') && hasResetIntent(t)) {
+            resetState(st)
+            markDirty(st)
+            await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.askOrder, meta)
+            return
+          }
 
-          setManual(st)
+          if (st.state === 'WAIT_PROOF') {
+            await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.proofNote, meta)
+            return
+          }
 
-          const profile = await getProfile(uid)
-          await push(
-            ADMIN_USER_ID,
-            `通關通知
-客人暱稱：${profile?.displayName || '未提供'}
-訂單編號：${st.order}
-付款圖ID：${st.proofMessageId || '未知'}`
-          )
-        } else {
-          await reply(e.replyToken, await gptReply('[客人傳了圖片，未提供文字]'))
-        }
-        return
-      }
+          if (st.state === 'DONE') {
+            await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.done, meta)
+            return
+          }
 
-      /* 其他非文字類型 */
-      if (e.message.type !== 'text') {
-        if (st.state === 'WAIT_PROOF') await reply(e.replyToken, TEXT.askProof)
-        else if (st.state === 'DONE') await reply(e.replyToken, TEXT.done)
-        else await reply(e.replyToken, TEXT.needText)
-        touch(st)
-        return
-      }
+          if (st.state === 'WAIT_ORDER' && isPureFiveDigits(t)) {
+            st.order = t.trim()
+            st.state = 'WAIT_PROOF'
+            markDirty(st)
+            await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.askProof, meta)
+            return
+          }
 
-      /* 文字 */
-      const t = (e.message.text || '').trim()
-      touch(st)
+          if (st.state === 'WAIT_ORDER' && hasPickupIntent(t)) {
+            const extracted = extractOrderCandidate(t)
+            if (extracted) {
+              st.order = extracted
+              st.state = 'WAIT_PROOF'
+              markDirty(st)
+              await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.askProof, meta)
+              return
+            }
+            await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.askOrder, meta)
+            return
+          }
 
-      // 只在 WAIT_ORDER 才吃 5 位數（避免亂切）
-      if (st.state === 'WAIT_ORDER' && isPureFiveDigits(t)) {
-        st.order = t
-        st.state = 'WAIT_PROOF'
-        await reply(e.replyToken, TEXT.askProof)
-        return
-      }
+          /* ===== 一般問題：KB → 否則 GPT（含排隊/反洗版） ===== */
 
-      if (st.state === 'WAIT_ORDER' && hasPickupIntent(t)) {
-        await reply(e.replyToken, TEXT.askOrder)
-        return
-      }
+          // KB 命中：直接回 KB（不走 GPT、不排隊）
+          const hits = kbTopK(t, 4)
+          if (hits.length) {
+            unqueueUser(uid, st)
+            await replyWithGreetingIfNeeded(st, e.replyToken, hits[0].answer || TEXT.busy, meta)
+            return
+          }
 
-      if (st.state === 'WAIT_PROOF') {
-        await reply(e.replyToken, TEXT.askProof)
-        return
-      }
+          if (!OPENAI_API_KEY) {
+            await replyWithGreetingIfNeeded(st, e.replyToken, TEXT.busy, meta)
+            return
+          }
 
-      if (st.state === 'DONE') {
-        await reply(e.replyToken, TEXT.done)
-        return
-      }
+          // ★ 若他本來就在排隊：不管目前是否有空位，都維持排隊規則（A 方案）
+          if (st.gptQueued) {
+            const r = handleQueuedAntiSpam(st, true)
+            if (r.replyText) await replyWithGreetingIfNeeded(st, e.replyToken, r.replyText, meta)
+            return
+          }
 
-      await reply(e.replyToken, await gptReply(t))
-    }).catch(err => console.error('[event] error', err))
+          // 併發滿了 → 排隊（並且這次訊息也算洗版）
+          if (gptActive >= GPT_MAX_CONCURRENT) {
+            const wasQueued = !!st.gptQueued
+            queueUserForGpt(uid, st)
+            const r = handleQueuedAntiSpam(st, wasQueued)
+            if (r.replyText) await replyWithGreetingIfNeeded(st, e.replyToken, r.replyText, meta)
+            return
+          }
+
+          // ★ 原子占位：避免同時放行超過 5
+          if (!tryAcquireGptSlot()) {
+            const wasQueued = !!st.gptQueued
+            queueUserForGpt(uid, st)
+            const r = handleQueuedAntiSpam(st, wasQueued)
+            if (r.replyText) await replyWithGreetingIfNeeded(st, e.replyToken, r.replyText, meta)
+            return
+          }
+
+          // GPT 有空位：解除排隊狀態（避免殘留）
+          unqueueUser(uid, st)
+
+          try {
+            const out = await gptReplyDirect(t)
+            await replyWithGreetingIfNeeded(st, e.replyToken, out, meta)
+          } finally {
+            releaseGptSlot()
+          }
+        }).catch(err => console.error('[event] error', err))
+      )
+    }
+
+    await Promise.allSettled(jobs)
+    safeRespond(200)
+  } catch (err) {
+    console.error(err)
+    safeRespond(500)
+  } finally {
+    clearTimeout(timer)
   }
 })
+
+/* ===== 啟動後：把 state.json 裡仍在排隊的人補回隊列（重啟不忘排隊）===== */
+function rebuildGptQueueFromStore() {
+  gptWaitQueue.length = 0
+  gptWaitHead = 0
+  gptQueuedSet.clear()
+
+  for (const [uid, st] of store) {
+    if (!st) continue
+    if (!st.gptQueued) continue
+    if (isManual(st)) continue
+    // ★ 不要跳過 cooldown：重啟後仍要保留在隊列，等冷卻結束再輪到
+    if (!gptQueuedSet.has(uid)) {
+      gptQueuedSet.add(uid)
+      gptWaitQueue.push(uid)
+    }
+  }
+}
+rebuildGptQueueFromStore()
 
 app.listen(process.env.PORT || 3000, () => console.log('Your service is live'))
