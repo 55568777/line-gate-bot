@@ -3,11 +3,13 @@ import crypto from 'crypto'
 import fetch from 'node-fetch'
 
 const app = express()
+
 const {
   CHANNEL_ACCESS_TOKEN,
   CHANNEL_SECRET,
-  ADMIN_USER_ID,
+  ADMIN_USER_ID,            // 你的私人LINE userId（U開頭32位）
   OPENAI_API_KEY,
+  ADMIN_PANEL_TOKEN,        // 你自訂一個長字串：例如 40+ 字元亂碼，用來保護 /admin/*
 } = process.env
 
 app.use(express.json({ verify: verifyLine }))
@@ -22,46 +24,41 @@ function verifyLine(req, res, buf) {
 }
 
 /* ===== 工具 ===== */
-function isPureFiveDigits(t) {
-  return /^\d{5}$/.test(t.trim())
-}
-function isValidUserId(u) {
-  return typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u)
-}
+function isPureFiveDigits(t) { return /^\d{5}$/.test((t || '').trim()) }
+function isValidUserId(u) { return typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u) }
 function now() { return Date.now() }
+function isAdmin(uid) { return uid && ADMIN_USER_ID && uid === ADMIN_USER_ID }
 
 /* ===== 文案 ===== */
 const TEXT = {
   askOrder: '請提供【5 位數訂單編號】。',
   askProof: '請上傳【付款明細截圖】（圖片）。',
   done: '資料已收齊，核對中；未通知前請勿重複詢問。',
+  manualOn: '已切換：人工接手 1 小時（此期間不自動回覆）。',
+  manualOff: '已切換：恢復自動回覆。',
 }
 
 /* ===== 狀態 =====
-state: WAIT_ORDER → WAIT_PROOF → DONE
-manualUntil: number（> now() 表示人工接手中）
+每個客人：state / order / pushed
+人工模式：用「全域」開關最符合你需求（你要手動就整段時間 bot 全面閉嘴）
 */
 const store = new Map()
 function getState(uid) {
   if (!store.has(uid)) {
-    store.set(uid, {
-      state: 'WAIT_ORDER',
-      order: null,
-      pushed: false,
-      manualUntil: 0,
-    })
+    store.set(uid, { state: 'WAIT_ORDER', order: null, pushed: false })
   }
   return store.get(uid)
 }
-function isManual(st) {
-  return st.manualUntil && st.manualUntil > now()
-}
-function setManual(st) {
-  st.manualUntil = now() + MANUAL_TTL_MS
-}
+
+/* ===== 全域人工模式（重點） ===== */
+let manualAllUntil = 0
+function isManualAll() { return manualAllUntil > now() }
+function setManualAll() { manualAllUntil = now() + MANUAL_TTL_MS }
+function clearManualAll() { manualAllUntil = 0 }
 
 /* ===== LINE API ===== */
 async function reply(replyToken, text) {
+  if (!replyToken) return
   await fetch('https://api.line.me/v2/bot/message/reply', {
     method: 'POST',
     headers: {
@@ -122,39 +119,68 @@ async function gptReply(userText) {
   return j.choices?.[0]?.message?.content || '客服系統暫時忙碌，請稍後再試。'
 }
 
+/* ===== 管理開關（方式B：瀏覽器一點切換） =====
+用法（你自己用，別給客人）：
+- 開人工： https://你的網域/admin/manual/on?token=ADMIN_PANEL_TOKEN
+- 關人工： https://你的網域/admin/manual/off?token=ADMIN_PANEL_TOKEN
+*/
+function adminAuth(req, res, next) {
+  const token = req.query?.token
+  if (!ADMIN_PANEL_TOKEN || token !== ADMIN_PANEL_TOKEN) return res.sendStatus(403)
+  next()
+}
+
+app.get('/admin/manual/on', adminAuth, async (req, res) => {
+  setManualAll()
+  res.status(200).send(`OK manual ON until=${new Date(manualAllUntil).toISOString()}`)
+})
+
+app.get('/admin/manual/off', adminAuth, async (req, res) => {
+  clearManualAll()
+  res.status(200).send('OK manual OFF')
+})
+
 /* ===== Webhook ===== */
 app.post('/webhook', async (req, res) => {
   try {
     const events = req.body?.events || []
 
-    /* ===== 自動偵測人工接手 =====
-       規則：只要「你本人（ADMIN_USER_ID）」傳文字，
-       就把「同一聊天室正在互動的客人」設為人工模式 1 小時。
-       LINE 事件中，當你回客時，source.userId === ADMIN_USER_ID
-    */
-    for (const e of events) {
-      if (e.type === 'message'
-          && e.source?.type === 'user'
-          && e.source?.userId === ADMIN_USER_ID
-          && e.message?.type === 'text') {
-        // 找出最近互動的客人（LINE OA 單聊即為該客人）
-        // 這裡假設同一 webhook 批次內，客人事件在前；保險做法是標記「全域人工鎖」
-        // 實務上：你一回話，該聊天室的客人就會被鎖
-        // 無需回覆任何東西
-      }
-    }
-
     for (const e of events) {
       if (e.type !== 'message') continue
+      if (e.source?.type !== 'user') continue
 
       const uid = e.source?.userId
+      const msgType = e.message?.type
+
+      /* ===== 方式A：你私聊 bot 打 #manual / #auto =====
+         注意：這要你用自己的 LINE 找到 bot（官方帳）單獨聊天室打一行指令
+      */
+      if (isAdmin(uid) && msgType === 'text') {
+        const t = (e.message.text || '').trim().toLowerCase()
+        if (t === '#manual') {
+          setManualAll()
+          await reply(e.replyToken, TEXT.manualOn)
+          continue
+        }
+        if (t === '#auto') {
+          clearManualAll()
+          await reply(e.replyToken, TEXT.manualOff)
+          continue
+        }
+        // 你講其他話：不回（避免干擾）
+        continue
+      }
+
+      /* ===== 人工模式期間：對所有客人全面靜默 ===== */
+      if (isManualAll()) {
+        continue
+      }
+
+      /* ===== 以下只處理「客人」 ===== */
       const st = getState(uid)
 
-      // 若此客人處於人工接手中 → 全面靜默（不回、不走 GPT、不走流程）
-      if (isManual(st)) continue
-
-      /* === 圖片一定是領貨 === */
-      if (e.message.type === 'image') {
+      /* === 圖片：領貨流程 === */
+      if (msgType === 'image') {
         if (st.state === 'WAIT_ORDER') {
           await reply(e.replyToken, TEXT.askOrder)
           continue
@@ -177,10 +203,10 @@ app.post('/webhook', async (req, res) => {
       }
 
       /* === 文字 === */
-      if (e.message.type === 'text') {
-        const t = e.message.text.trim()
+      if (msgType === 'text') {
+        const t = (e.message.text || '').trim()
 
-        // 純 5 位數 → 領貨
+        // 5 位數訂單 → 進 WAIT_PROOF
         if (isPureFiveDigits(t)) {
           st.order = t
           st.state = 'WAIT_PROOF'
@@ -188,13 +214,17 @@ app.post('/webhook', async (req, res) => {
           continue
         }
 
-        // 已在流程中 → 不給 GPT
-        if (st.state !== 'WAIT_ORDER') {
+        // 領貨流程中，不走 GPT
+        if (st.state === 'WAIT_PROOF') {
           await reply(e.replyToken, TEXT.askProof)
           continue
         }
+        if (st.state === 'DONE') {
+          await reply(e.replyToken, TEXT.done)
+          continue
+        }
 
-        // 其他 → GPT 客服
+        // 其他 → GPT
         const ans = await gptReply(t)
         await reply(e.replyToken, ans)
       }
@@ -207,6 +237,4 @@ app.post('/webhook', async (req, res) => {
   }
 })
 
-app.listen(process.env.PORT || 3000, () =>
-  console.log('Your service is live')
-)
+app.listen(process.env.PORT || 3000, () => console.log('Your service is live'))
