@@ -5,42 +5,67 @@ import fetch from 'node-fetch'
 const app = express()
 const { CHANNEL_ACCESS_TOKEN, CHANNEL_SECRET, ADMIN_USER_ID } = process.env
 
-console.log('ENV_ADMIN_USER_ID=', JSON.stringify(ADMIN_USER_ID))
-
 app.use(express.json({ verify: verifyLine }))
 
-const cache = new Map()
-
+/* ===== LINE 驗簽 ===== */
 function verifyLine(req, res, buf) {
   const sig = crypto.createHmac('sha256', CHANNEL_SECRET).update(buf).digest('base64')
   if (sig !== req.headers['x-line-signature']) throw new Error('Bad signature')
 }
 
-function isValidLineUserId(u) {
-  return typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u.trim())
+/* ===== 工具 ===== */
+function isFiveDigits(t) {
+  return /^\d{5}$/.test(t)
 }
 
-// 取得 LINE 顯示名稱
-async function getProfile(userId) {
-  try {
-    const r = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
-      headers: {
-        'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}`,
-      },
+function isValidUserId(u) {
+  return typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u)
+}
+
+/* ===== 對話文案（客人端） ===== */
+const TEXT = {
+  askOrder: '請提供【5 位數訂單編號】（僅收數字）。',
+  askProof: '請上傳【付款明細截圖】（圖片）。',
+  done: '資料已收齊，通知真人發貨客服核對中；未通知前請勿重複詢問。',
+  follow: '僅依流程處理，請提供【訂單編號＋付款截圖】。',
+}
+
+/* ===== 暫存狀態 =====
+state:
+- WAIT_ORDER
+- WAIT_PROOF
+- DONE
+*/
+const store = new Map()
+
+function getState(uid) {
+  if (!store.has(uid)) {
+    store.set(uid, {
+      state: 'WAIT_ORDER',
+      order: null,
+      pushed: false,
     })
-    if (!r.ok) return null
-    return await r.json() // { displayName, pictureUrl, statusMessage }
-  } catch {
-    return null
   }
+  return store.get(uid)
 }
 
-async function push(to, messages) {
-  const toClean = String(to || '').trim()
-  if (!isValidLineUserId(toClean)) {
-    console.log('BAD_TO:', JSON.stringify(toClean))
-    return
-  }
+/* ===== LINE API ===== */
+async function reply(replyToken, text) {
+  await fetch('https://api.line.me/v2/bot/message/reply', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify({
+      replyToken,
+      messages: [{ type: 'text', text }],
+    }),
+  })
+}
+
+async function push(to, text) {
+  if (!isValidUserId(to)) return
 
   const r = await fetch('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
@@ -48,50 +73,89 @@ async function push(to, messages) {
       'Content-Type': 'application/json',
       'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({ to: toClean, messages }),
+    body: JSON.stringify({
+      to,
+      messages: [{ type: 'text', text }],
+    }),
   })
 
-  const txt = await r.text()
-  console.log('PUSH_STATUS', r.status, txt)
+  const body = await r.text()
+  console.log('PUSH_STATUS', r.status, body)
 }
 
+async function getProfile(uid) {
+  try {
+    const r = await fetch(`https://api.line.me/v2/bot/profile/${uid}`, {
+      headers: { 'Authorization': `Bearer ${CHANNEL_ACCESS_TOKEN}` },
+    })
+    if (!r.ok) return null
+    return await r.json() // { displayName }
+  } catch {
+    return null
+  }
+}
+
+/* ===== Webhook ===== */
 app.post('/webhook', async (req, res) => {
   try {
     for (const e of req.body?.events || []) {
       if (e.type !== 'message') continue
 
       const uid = e.source?.userId
-      console.log('FROM USER:', uid)
+      const st = getState(uid)
 
-      if (e.message?.type === 'text') {
-        const m = String(e.message.text || '').match(/\b\d{5}\b/)
-        if (m) {
-          cache.set(uid, { order: m[0] })
-          console.log('ORDER OK:', m[0])
+      /* ===== 文字 ===== */
+      if (e.message.type === 'text') {
+        const t = e.message.text.trim()
+
+        if (st.state === 'WAIT_ORDER') {
+          if (isFiveDigits(t)) {
+            st.order = t
+            st.state = 'WAIT_PROOF'
+            await reply(e.replyToken, TEXT.askProof)
+          } else {
+            await reply(e.replyToken, TEXT.askOrder)
+          }
+          continue
         }
+
+        if (st.state === 'WAIT_PROOF') {
+          await reply(e.replyToken, TEXT.askProof)
+          continue
+        }
+
+        await reply(e.replyToken, TEXT.done)
+        continue
       }
 
-      if (e.message?.type === 'image') {
-        const st = cache.get(uid)
-        if (st?.order) {
-          console.log('READY_TO_PUSH')
+      /* ===== 圖片 ===== */
+      if (e.message.type === 'image') {
+        if (st.state === 'WAIT_ORDER') {
+          await reply(e.replyToken, TEXT.askOrder)
+          continue
+        }
+
+        if (st.state === 'WAIT_PROOF' && !st.pushed) {
+          st.state = 'DONE'
+          st.pushed = true
+
+          await reply(e.replyToken, TEXT.done)
 
           const profile = await getProfile(uid)
-          const name = profile?.displayName || '（無法取得暱稱）'
+          const name = profile?.displayName || '（未提供暱稱）'
 
-          await push(ADMIN_USER_ID, [{
-            type: 'text',
-            text:
-`通關通知
-暱稱：${name}
-USER_ID：${uid}
-訂單：${st.order}`
-          }])
+          await push(
+            ADMIN_USER_ID,
+            `通關通知\n客人暱稱：${name}\n訂單編號：${st.order}`
+          )
 
-          cache.delete(uid)
+          continue
         }
+
+        await reply(e.replyToken, TEXT.done)
       }
     }
+
     res.sendStatus(200)
   } catch (err) {
     console.error(err)
