@@ -69,6 +69,7 @@ app.post("/webhook", async (req, res) => {
   for (const ev of req.body.events || []) {
     if (ev.type !== "message") continue;
     const uid = ev.source.userId;
+    console.log("FROM USER:", uid);
     const st = getState(uid);
 
     if (ev.message.type === "text") {
@@ -120,3 +121,4 @@ app.post("/webhook", async (req, res) => {
 
 app.get("/", (_, res) => res.send("ok"));
 app.listen(process.env.PORT || 3000);
+
