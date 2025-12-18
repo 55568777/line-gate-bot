@@ -7,15 +7,14 @@ const app = express()
 const {
   CHANNEL_ACCESS_TOKEN,
   CHANNEL_SECRET,
-  ADMIN_USER_ID,            // 你的私人LINE userId（U開頭32位）
+  ADMIN_USER_ID,     // 你的私人 LINE userId（U開頭32位）
   OPENAI_API_KEY,
-  ADMIN_PANEL_TOKEN,        // 可留可刪；保護 /admin/*
 } = process.env
 
 app.use(express.json({ verify: verifyLine }))
 
 /* ===== 常數 ===== */
-const MANUAL_TTL_MS = 60 * 60 * 1000        // 1 小時（通關後自動進人工）
+const MANUAL_TTL_MS = 60 * 60 * 1000        // 通關後：該客人單獨人工 1 小時
 const MANUAL_PING_COOLDOWN_MS = 30 * 1000   // 人工期間：同一客人推播最短間隔
 
 /* ===== 驗簽 ===== */
@@ -28,7 +27,7 @@ function verifyLine(req, res, buf) {
 function isPureFiveDigits(t) { return /^\d{5}$/.test((t || '').trim()) }
 function isValidUserId(u) { return typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u) }
 function now() { return Date.now() }
-function isAdmin(uid) { return uid && ADMIN_USER_ID && uid === ADMIN_USER_ID }
+
 function briefOfMessage(e) {
   const mt = e?.message?.type
   if (mt === 'text') return (e.message.text || '').slice(0, 80)
@@ -45,11 +44,12 @@ const TEXT = {
   askOrder: '請提供【5 位數訂單編號】。',
   askProof: '請上傳【付款明細截圖】（圖片）。',
   done: '資料已收齊，核對中；未通知前請勿重複詢問。',
-  manualOn: '已切換：人工接手 1 小時（此期間不自動回覆）。',
-  manualOff: '已切換：恢復自動回覆。',
 }
 
-/* ===== 狀態 ===== */
+/* ===== 狀態 =====
+state: WAIT_ORDER → WAIT_PROOF → DONE
+manualUntil: 通關後自動開（單一客人）
+*/
 const store = new Map()
 function getState(uid) {
   if (!store.has(uid)) {
@@ -57,17 +57,14 @@ function getState(uid) {
       state: 'WAIT_ORDER',
       order: null,
       pushed: false,
-      _lastManualPingAt: 0,   // 人工期間防洗版推播
+      manualUntil: 0,
+      _lastManualPingAt: 0,
     })
   }
   return store.get(uid)
 }
-
-/* ===== 全域人工模式（重點） ===== */
-let manualAllUntil = 0
-function isManualAll() { return manualAllUntil > now() }
-function setManualAll() { manualAllUntil = now() + MANUAL_TTL_MS }
-function clearManualAll() { manualAllUntil = 0 }
+function isManual(st) { return st.manualUntil && st.manualUntil > now() }
+function setManual(st) { st.manualUntil = now() + MANUAL_TTL_MS }
 
 /* ===== LINE API ===== */
 async function reply(replyToken, text) {
@@ -132,23 +129,6 @@ async function gptReply(userText) {
   return j.choices?.[0]?.message?.content || '客服系統暫時忙碌，請稍後再試。'
 }
 
-/* ===== 管理開關（可留可刪） ===== */
-function adminAuth(req, res, next) {
-  const token = req.query?.token
-  if (!ADMIN_PANEL_TOKEN || token !== ADMIN_PANEL_TOKEN) return res.sendStatus(403)
-  next()
-}
-
-app.get('/admin/manual/on', adminAuth, async (req, res) => {
-  setManualAll()
-  res.status(200).send(`OK manual ON until=${new Date(manualAllUntil).toISOString()}`)
-})
-
-app.get('/admin/manual/off', adminAuth, async (req, res) => {
-  clearManualAll()
-  res.status(200).send('OK manual OFF')
-})
-
 /* ===== Webhook ===== */
 app.post('/webhook', async (req, res) => {
   try {
@@ -160,32 +140,13 @@ app.post('/webhook', async (req, res) => {
 
       const uid = e.source?.userId
       const msgType = e.message?.type
-
-      /* ===== 方式A：你私聊 bot 打 #manual / #auto ===== */
-      if (isAdmin(uid) && msgType === 'text') {
-        const t = (e.message.text || '').trim().toLowerCase()
-        if (t === '#manual') {
-          setManualAll()
-          await reply(e.replyToken, TEXT.manualOn)
-          continue
-        }
-        if (t === '#auto') {
-          clearManualAll()
-          await reply(e.replyToken, TEXT.manualOff)
-          continue
-        }
-        continue
-      }
-
-      /* ===== 以下只處理「客人」 ===== */
       const st = getState(uid)
 
-      /* ===== 人工模式期間：不回客，但要推播通知給你 ===== */
-      if (isManualAll()) {
+      /* ===== 人工期間（單一客人）：不回客，但要推播通知給你 ===== */
+      if (isManual(st)) {
         const canPing = (now() - (st._lastManualPingAt || 0)) > MANUAL_PING_COOLDOWN_MS
         if (canPing) {
           st._lastManualPingAt = now()
-
           const profile = await getProfile(uid)
           const name = profile?.displayName || '（未提供暱稱）'
           const brief = briefOfMessage(e)
@@ -209,14 +170,14 @@ app.post('/webhook', async (req, res) => {
           st.pushed = true
           await reply(e.replyToken, TEXT.done)
 
-          // ✅ 方案1：通關後自動進人工（全域）
-          setManualAll()
+          // ✅ 通關後：只鎖「這位客人」1 小時（bot 對他靜默，但仍會推播他後續訊息）
+          setManual(st)
 
           const profile = await getProfile(uid)
           const name = profile?.displayName || '（未提供暱稱）'
           await push(
             ADMIN_USER_ID,
-            `通關通知\n客人暱稱：${name}\n訂單編號：${st.order}\n（已自動進入人工模式 1 小時）`
+            `通關通知\n客人暱稱：${name}\n訂單編號：${st.order}\n（此客人已自動進入人工 1 小時）`
           )
           continue
         }
