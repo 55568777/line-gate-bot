@@ -108,9 +108,18 @@ async function gptReply(userText) {
       ],
     }),
   })
-  const j = await r.json()
-  return j.choices?.[0]?.message?.content || '請依流程提供資料。'
+
+  const txt = await r.text()
+  console.log('GPT_STATUS', r.status, txt)
+
+  if (!r.ok) {
+    return '客服系統暫時忙碌，請稍後再試。'
+  }
+
+  const j = JSON.parse(txt)
+  return j.choices?.[0]?.message?.content || '客服系統暫時忙碌，請稍後再試。'
 }
+
 
 /* ===== Webhook ===== */
 app.post('/webhook', async (req, res) => {
@@ -188,3 +197,4 @@ app.post('/webhook', async (req, res) => {
 app.listen(process.env.PORT || 3000, () =>
   console.log('Your service is live')
 )
+
