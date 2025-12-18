@@ -14,8 +14,8 @@ const {
 app.use(express.json({ verify: verifyLine }))
 
 /* ===== 常數 ===== */
-const MANUAL_TTL_MS = 60 * 60 * 1000        // 通關後：該客人單獨人工 1 小時
-const MANUAL_PING_COOLDOWN_MS = 30 * 1000   // 人工期間：同一客人推播最短間隔
+const MANUAL_TTL_MS = 60 * 60 * 1000          // 通關後：該客人單獨人工 1 小時
+const MANUAL_PING_COOLDOWN_MS = 2 * 60 * 1000 // 彙整推播：每位客人最多 2 分鐘推一次
 
 /* ===== 驗簽 ===== */
 function verifyLine(req, res, buf) {
@@ -46,10 +46,7 @@ const TEXT = {
   done: '資料已收齊，核對中；未通知前請勿重複詢問。',
 }
 
-/* ===== 狀態 =====
-state: WAIT_ORDER → WAIT_PROOF → DONE
-manualUntil: 通關後自動開（單一客人）
-*/
+/* ===== 狀態 ===== */
 const store = new Map()
 function getState(uid) {
   if (!store.has(uid)) {
@@ -57,14 +54,25 @@ function getState(uid) {
       state: 'WAIT_ORDER',
       order: null,
       pushed: false,
+
       manualUntil: 0,
+
+      // 彙整推播用
       _lastManualPingAt: 0,
+      _manualBurstCount: 0,
+      _manualLastBrief: '',
     })
   }
   return store.get(uid)
 }
+
 function isManual(st) { return st.manualUntil && st.manualUntil > now() }
-function setManual(st) { st.manualUntil = now() + MANUAL_TTL_MS }
+function setManual(st) {
+  st.manualUntil = now() + MANUAL_TTL_MS
+  st._lastManualPingAt = 0
+  st._manualBurstCount = 0
+  st._manualLastBrief = ''
+}
 
 /* ===== LINE API ===== */
 async function reply(replyToken, text) {
@@ -142,18 +150,28 @@ app.post('/webhook', async (req, res) => {
       const msgType = e.message?.type
       const st = getState(uid)
 
-      /* ===== 人工期間（單一客人）：不回客，但要推播通知給你 ===== */
+      /* ===== 人工期間（單一客人）：不回客，但要「彙整」推播給你 ===== */
       if (isManual(st)) {
-        const canPing = (now() - (st._lastManualPingAt || 0)) > MANUAL_PING_COOLDOWN_MS
+        st._manualBurstCount = (st._manualBurstCount || 0) + 1
+        st._manualLastBrief = briefOfMessage(e)
+
+        const lastAt = st._lastManualPingAt || 0
+        const canPing = (now() - lastAt) > MANUAL_PING_COOLDOWN_MS
+
         if (canPing) {
           st._lastManualPingAt = now()
+
           const profile = await getProfile(uid)
           const name = profile?.displayName || '（未提供暱稱）'
-          const brief = briefOfMessage(e)
+
+          const n = st._manualBurstCount || 0
+          const last = st._manualLastBrief || ''
+          st._manualBurstCount = 0
+          st._manualLastBrief = ''
 
           await push(
             ADMIN_USER_ID,
-            `人工期間新訊息\n客人暱稱：${name}\n訂單：${st.order || '（未填）'}\n內容：${brief}`
+            `人工期間新訊息（彙整）\n客人暱稱：${name}\n訂單：${st.order || '（未填）'}\n本段共：${n} 則\n最後：${last}`
           )
         }
         continue
@@ -170,14 +188,14 @@ app.post('/webhook', async (req, res) => {
           st.pushed = true
           await reply(e.replyToken, TEXT.done)
 
-          // ✅ 通關後：只鎖「這位客人」1 小時（bot 對他靜默，但仍會推播他後續訊息）
+          // 通關後：只鎖這位客人 1 小時
           setManual(st)
 
           const profile = await getProfile(uid)
           const name = profile?.displayName || '（未提供暱稱）'
           await push(
             ADMIN_USER_ID,
-            `通關通知\n客人暱稱：${name}\n訂單編號：${st.order}\n（此客人已自動進入人工 1 小時）`
+            `通關通知\n客人暱稱：${name}\n訂單編號：${st.order}`
           )
           continue
         }
