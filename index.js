@@ -39,6 +39,29 @@ function briefOfMessage(e) {
   return `[${mt || 'unknown'}]`
 }
 
+/* ✅ 領貨/付款/序號意圖：WAIT_ORDER 時命中就直接要 5 位數訂單（不走 GPT） */
+function hasPickupIntent(t) {
+  const s = (t || '').trim().toLowerCase()
+
+  // ❌ 你指定不要攔的
+  const exclude = /(等很久了|怎麼那麼久|到底好了沒|處理一下|回一下|在嗎|人呢|快一點|不回是怎樣)/i
+  if (exclude.test(s)) return false
+
+  // ✅ 要攔的（付款／領貨／序號／出貨／查單）
+  const include = /(已付款|我已付款|付款了|付了|錢付了|付過了|
+                    已轉帳|轉帳了|匯款了|已匯款|繳費了|已繳費|付款完成|
+                    刷卡了|刷過了|有付錢|有給錢|
+                    領貨|取貨|拿貨|我要領|我要拿|可以領了嗎|可以拿了嗎|
+                    出貨了嗎|幾時出貨|發貨了嗎|什麼時候發|
+                    寄了嗎|寄了沒|幾時寄|什麼時候到|到了沒|
+                    序號呢|序號在哪|卡呢|點數呢|
+                    怎麼還沒給|沒收到序號|沒發|還沒發|
+                    東西呢|貨呢|
+                    我都付了|什麼時候好|幫我看一下|看一下訂單|幫我查|查一下)/ix
+
+  return include.test(s)
+}
+
 /* ===== 文案 ===== */
 const TEXT = {
   askOrder: '請提供【5 位數訂單編號】。',
@@ -212,6 +235,12 @@ app.post('/webhook', async (req, res) => {
           st.order = t
           st.state = 'WAIT_PROOF'
           await reply(e.replyToken, TEXT.askProof)
+          continue
+        }
+
+        // ✅ WAIT_ORDER 時命中「領貨/付款/序號」意圖 → 直接要訂單（不走 GPT）
+        if (st.state === 'WAIT_ORDER' && hasPickupIntent(t)) {
+          await reply(e.replyToken, TEXT.askOrder)
           continue
         }
 
