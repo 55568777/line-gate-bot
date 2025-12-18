@@ -9,13 +9,14 @@ const {
   CHANNEL_SECRET,
   ADMIN_USER_ID,            // 你的私人LINE userId（U開頭32位）
   OPENAI_API_KEY,
-  ADMIN_PANEL_TOKEN,        // 你自訂一個長字串：例如 40+ 字元亂碼，用來保護 /admin/*
+  ADMIN_PANEL_TOKEN,        // 可留可刪；保護 /admin/*
 } = process.env
 
 app.use(express.json({ verify: verifyLine }))
 
 /* ===== 常數 ===== */
-const MANUAL_TTL_MS = 60 * 60 * 1000 // 1 小時
+const MANUAL_TTL_MS = 60 * 60 * 1000        // 1 小時（通關後自動進人工）
+const MANUAL_PING_COOLDOWN_MS = 30 * 1000   // 人工期間：同一客人推播最短間隔
 
 /* ===== 驗簽 ===== */
 function verifyLine(req, res, buf) {
@@ -28,6 +29,16 @@ function isPureFiveDigits(t) { return /^\d{5}$/.test((t || '').trim()) }
 function isValidUserId(u) { return typeof u === 'string' && /^U[0-9a-f]{32}$/i.test(u) }
 function now() { return Date.now() }
 function isAdmin(uid) { return uid && ADMIN_USER_ID && uid === ADMIN_USER_ID }
+function briefOfMessage(e) {
+  const mt = e?.message?.type
+  if (mt === 'text') return (e.message.text || '').slice(0, 80)
+  if (mt === 'image') return '[圖片]'
+  if (mt === 'video') return '[影片]'
+  if (mt === 'audio') return '[音訊]'
+  if (mt === 'file') return `[檔案] ${(e.message.fileName || '').slice(0, 40)}`
+  if (mt === 'sticker') return '[貼圖]'
+  return `[${mt || 'unknown'}]`
+}
 
 /* ===== 文案 ===== */
 const TEXT = {
@@ -38,14 +49,16 @@ const TEXT = {
   manualOff: '已切換：恢復自動回覆。',
 }
 
-/* ===== 狀態 =====
-每個客人：state / order / pushed
-人工模式：用「全域」開關最符合你需求（你要手動就整段時間 bot 全面閉嘴）
-*/
+/* ===== 狀態 ===== */
 const store = new Map()
 function getState(uid) {
   if (!store.has(uid)) {
-    store.set(uid, { state: 'WAIT_ORDER', order: null, pushed: false })
+    store.set(uid, {
+      state: 'WAIT_ORDER',
+      order: null,
+      pushed: false,
+      _lastManualPingAt: 0,   // 人工期間防洗版推播
+    })
   }
   return store.get(uid)
 }
@@ -119,11 +132,7 @@ async function gptReply(userText) {
   return j.choices?.[0]?.message?.content || '客服系統暫時忙碌，請稍後再試。'
 }
 
-/* ===== 管理開關（方式B：瀏覽器一點切換） =====
-用法（你自己用，別給客人）：
-- 開人工： https://你的網域/admin/manual/on?token=ADMIN_PANEL_TOKEN
-- 關人工： https://你的網域/admin/manual/off?token=ADMIN_PANEL_TOKEN
-*/
+/* ===== 管理開關（可留可刪） ===== */
 function adminAuth(req, res, next) {
   const token = req.query?.token
   if (!ADMIN_PANEL_TOKEN || token !== ADMIN_PANEL_TOKEN) return res.sendStatus(403)
@@ -152,9 +161,7 @@ app.post('/webhook', async (req, res) => {
       const uid = e.source?.userId
       const msgType = e.message?.type
 
-      /* ===== 方式A：你私聊 bot 打 #manual / #auto =====
-         注意：這要你用自己的 LINE 找到 bot（官方帳）單獨聊天室打一行指令
-      */
+      /* ===== 方式A：你私聊 bot 打 #manual / #auto ===== */
       if (isAdmin(uid) && msgType === 'text') {
         const t = (e.message.text || '').trim().toLowerCase()
         if (t === '#manual') {
@@ -167,17 +174,29 @@ app.post('/webhook', async (req, res) => {
           await reply(e.replyToken, TEXT.manualOff)
           continue
         }
-        // 你講其他話：不回（避免干擾）
-        continue
-      }
-
-      /* ===== 人工模式期間：對所有客人全面靜默 ===== */
-      if (isManualAll()) {
         continue
       }
 
       /* ===== 以下只處理「客人」 ===== */
       const st = getState(uid)
+
+      /* ===== 人工模式期間：不回客，但要推播通知給你 ===== */
+      if (isManualAll()) {
+        const canPing = (now() - (st._lastManualPingAt || 0)) > MANUAL_PING_COOLDOWN_MS
+        if (canPing) {
+          st._lastManualPingAt = now()
+
+          const profile = await getProfile(uid)
+          const name = profile?.displayName || '（未提供暱稱）'
+          const brief = briefOfMessage(e)
+
+          await push(
+            ADMIN_USER_ID,
+            `人工期間新訊息\n客人暱稱：${name}\n訂單：${st.order || '（未填）'}\n內容：${brief}`
+          )
+        }
+        continue
+      }
 
       /* === 圖片：領貨流程 === */
       if (msgType === 'image') {
@@ -190,11 +209,14 @@ app.post('/webhook', async (req, res) => {
           st.pushed = true
           await reply(e.replyToken, TEXT.done)
 
+          // ✅ 方案1：通關後自動進人工（全域）
+          setManualAll()
+
           const profile = await getProfile(uid)
           const name = profile?.displayName || '（未提供暱稱）'
           await push(
             ADMIN_USER_ID,
-            `通關通知\n客人暱稱：${name}\n訂單編號：${st.order}`
+            `通關通知\n客人暱稱：${name}\n訂單編號：${st.order}\n（已自動進入人工模式 1 小時）`
           )
           continue
         }
